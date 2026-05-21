@@ -22,7 +22,7 @@ app.use((req, res, next) => {
     "GET, POST, PUT, DELETE, OPTIONS"
   );
 
-  // RESPONDER PREFLIGHT
+  // PREFLIGHT
   if (req.method === "OPTIONS") {
     return res.sendStatus(200);
   }
@@ -51,6 +51,7 @@ app.get("/", (req, res) => {
 
 app.post("/apply-campaign", async (req, res) => {
 
+  // RESPUESTA INMEDIATA
   res.json({
     ok: true,
     message: "Campaña iniciada"
