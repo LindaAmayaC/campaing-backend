@@ -1,3 +1,4 @@
+require("dotenv").config();
 
 const express = require("express");
 const axios = require("axios");
@@ -13,25 +14,18 @@ const app = express();
 const corsOptions = {
   origin: "https://viajesyviajes.bitrix24.es",
   methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-  allowedHeaders: [
-    "Content-Type",
-    "Authorization"
-  ],
+  allowedHeaders: ["Content-Type", "Authorization"],
   credentials: true,
 };
 
 app.use(cors(corsOptions));
-
-// responder preflight
 app.options("*", cors(corsOptions));
 
 // ===============================
 // JSON
 // ===============================
 
-app.use(express.json({
-  limit: "50mb"
-}));
+app.use(express.json({ limit: "50mb" }));
 
 const limit = pLimit(3);
 
@@ -44,93 +38,88 @@ app.get("/", (req, res) => {
 });
 
 // ===============================
-// APPLY CAMPAIGN
+// APPLY CAMPAIGN - WHATSAPP (relay)
 // ===============================
+//
+// Espera body:
+// {
+//   phoneNumberId: "990605564142727",
+//   messages: [
+//     { to: "57XXXXXXXXXX", payload: { messaging_product, to, type, template, ... } },
+//     ...
+//   ]
+// }
+//
+// El frontend arma cada `payload` listo para Meta (igual que hoy hace
+// sendWhatsappMessages en ViajesYV). Este endpoint solo reenvía.
+// El token sale de process.env.WHATSAPP_TOKEN.
 
-app.post("/apply-campaign", async (req, res) => {
-
-  res.json({
-    ok: true,
-    message: "Campaña iniciada",
-  });
-
-  try {
-
-    const {
-      contacts = [],
-      token,
-      templateName,
-      phoneNumberId
-    } = req.body;
-
-    console.log(`Procesando ${contacts.length} contactos`);
-
-    const jobs = contacts.map((contact) =>
-      limit(async () => {
-
-        await new Promise(r => setTimeout(r, 1500));
-
-        try {
-
-          await axios.post(
-            `https://graph.facebook.com/v22.0/${phoneNumberId}/messages`,
-            {
-              messaging_product: "whatsapp",
-              to: contact.phone,
-              type: "template",
-              template: {
-                name: templateName,
-                language: {
-                  code: "es_CO",
-                },
-                components: [
-                  {
-                    type: "body",
-                    parameters: [
-                      {
-                        type: "text",
-                        parameter_name: "nombre",
-                        text: contact.name || "Cliente",
-                      },
-                      {
-                        type: "text",
-                        parameter_name: "destino",
-                        text: contact.campaign || "Campana",
-                      },
-                    ],
-                  },
-                ],
-              },
-            },
-            {
-              headers: {
-                Authorization: `Bearer ${token}`,
-                "Content-Type": "application/json",
-              },
-            },
-          );
-
-          console.log("OK:", contact.phone);
-
-        } catch (err) {
-
-          console.error(
-            "ERROR:",
-            contact.phone,
-            err?.response?.data || err.message,
-          );
-
-        }
-      }),
-    );
-
-    await Promise.allSettled(jobs);
-
-    console.log("Campaña finalizada");
-
-  } catch (err) {
-    console.error(err);
+app.post("/apply-campaign/whatsapp", async (req, res) => {
+  const token = process.env.WHATSAPP_TOKEN;
+  if (!token) {
+    return res
+      .status(500)
+      .json({ ok: false, error: "WHATSAPP_TOKEN no configurado en el servidor." });
   }
+
+  const { phoneNumberId, messages } = req.body || {};
+
+  if (!phoneNumberId) {
+    return res
+      .status(400)
+      .json({ ok: false, error: "Falta phoneNumberId en el body." });
+  }
+  if (!Array.isArray(messages) || messages.length === 0) {
+    return res
+      .status(400)
+      .json({ ok: false, error: "messages debe ser un array no vacío." });
+  }
+
+  const url = `https://graph.facebook.com/v22.0/${encodeURIComponent(phoneNumberId)}/messages`;
+
+  console.log(`[apply-campaign/whatsapp] enviando ${messages.length} mensajes`);
+
+  const results = { ok: true, sent: 0, errors: [] };
+
+  const jobs = messages.map((msg) =>
+    limit(async () => {
+      const to = msg?.to || msg?.payload?.to || "desconocido";
+      const payload = msg?.payload;
+      if (!payload) {
+        results.ok = false;
+        results.errors.push(`(${to}) payload vacío`);
+        return;
+      }
+
+      try {
+        await axios.post(url, payload, {
+          headers: {
+            Authorization: `Bearer ${token}`,
+            "Content-Type": "application/json",
+          },
+        });
+        results.sent += 1;
+        console.log("OK:", to);
+      } catch (err) {
+        const errMsg =
+          err?.response?.data?.error?.message ||
+          err?.response?.data ||
+          err.message ||
+          "Error desconocido";
+        results.ok = false;
+        results.errors.push(`(${to}) ${typeof errMsg === "string" ? errMsg : JSON.stringify(errMsg)}`);
+        console.error("ERROR:", to, errMsg);
+      }
+    }),
+  );
+
+  await Promise.allSettled(jobs);
+
+  console.log(
+    `[apply-campaign/whatsapp] finalizado: ${results.sent} ok, ${results.errors.length} errores`,
+  );
+
+  res.json(results);
 });
 
 const PORT = process.env.PORT || 3000;
