@@ -5,28 +5,26 @@ const pLimit = require("p-limit").default;
 const app = express();
 
 // ===============================
-// CORS FIX
+// CORS GLOBAL FIX
 // ===============================
 
 app.use((req, res, next) => {
 
-  res.setHeader(
-    "Access-Control-Allow-Origin",
-    "*"
+  res.header("Access-Control-Allow-Origin", "*");
+
+  res.header(
+    "Access-Control-Allow-Headers",
+    "Origin, X-Requested-With, Content-Type, Accept, Authorization"
   );
 
- res.setHeader(
-  "Access-Control-Allow-Headers",
-  "Content-Type"
-);
-
-  res.setHeader(
+  res.header(
     "Access-Control-Allow-Methods",
     "GET, POST, PUT, DELETE, OPTIONS"
   );
 
+  // RESPONDER PREFLIGHT
   if (req.method === "OPTIONS") {
-    return res.status(200).end();
+    return res.sendStatus(200);
   }
 
   next();
@@ -44,7 +42,7 @@ const limit = pLimit(15);
 // ===============================
 
 app.get("/", (req, res) => {
-  res.send("Backend PRUEBA 5");
+  res.send("Backend funcionando 🚀");
 });
 
 // ===============================
