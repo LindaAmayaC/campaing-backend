@@ -1,7 +1,7 @@
 const express = require("express");
 const cors = require("cors");
 const axios = require("axios");
-const pLimit = require("p-limit");
+const pLimit = require("p-limit").default;
 
 const app = express();
 
