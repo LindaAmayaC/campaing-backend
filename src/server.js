@@ -9,10 +9,23 @@ const app = express();
 
 // ===============================
 // CORS BITRIX
+// Acepta tanto el portal (viajesyviajes.bitrix24.es) como el CDN donde
+// se sirven las "local apps" (apps-*.bitrix24-cdn.com).
 // ===============================
 
+const allowedOriginPatterns = [
+  /^https:\/\/[a-z0-9-]+\.bitrix24\.es$/i,
+  /^https:\/\/[a-z0-9-]+\.bitrix24-cdn\.com$/i,
+];
+
 const corsOptions = {
-  origin: "https://viajesyviajes.bitrix24.es",
+  origin: (origin, callback) => {
+    if (!origin) return callback(null, true); // peticiones server-to-server o curl
+    const ok = allowedOriginPatterns.some((re) => re.test(origin));
+    if (ok) return callback(null, true);
+    console.warn("[CORS] Origin no permitido:", origin);
+    return callback(new Error("Origin no permitido: " + origin));
+  },
   methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization"],
   credentials: true,
