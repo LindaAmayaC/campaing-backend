@@ -1,3 +1,4 @@
+
 const express = require("express");
 const axios = require("axios");
 const cors = require("cors");
@@ -5,30 +6,30 @@ const pLimit = require("p-limit").default;
 
 const app = express();
 
-// ===============================
-// CORS GLOBAL FIX
-// ===============================
+app.use(cors());
 
-app.use(
-  cors({
-    origin: "*",
-    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allowedHeaders: [
-      "Origin",
-      "X-Requested-With",
-      "Content-Type",
-      "Accept",
-      "Authorization",
-    ],
-  }),
-);
+app.use((req, res, next) => {
+  res.header("Access-Control-Allow-Origin", "*");
+  res.header(
+    "Access-Control-Allow-Headers",
+    "Origin, X-Requested-With, Content-Type, Accept, Authorization"
+  );
+  res.header(
+    "Access-Control-Allow-Methods",
+    "GET, POST, PUT, DELETE, OPTIONS"
+  );
 
+  if (req.method === "OPTIONS") {
+    return res.sendStatus(200);
+  }
 
-app.use(
-  express.json({
-    limit: "50mb",
-  }),
-);
+  next();
+});
+
+app.use(express.json({
+  limit: "50mb"
+}));
+
 const limit = pLimit(3);
 // ===============================
 // HOME
