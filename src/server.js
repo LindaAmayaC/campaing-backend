@@ -26,10 +26,6 @@ app.use((req, res, next) => {
     "GET, POST, PUT, DELETE, OPTIONS"
   );
 
-  if (req.method === "OPTIONS") {
-    return res.sendStatus(200);
-  }
-
   next();
 
 });
@@ -42,9 +38,39 @@ app.use(express.json({
 
 const limit = pLimit(15);
 
+// ===============================
+// HOME
+// ===============================
+
 app.get("/", (req, res) => {
   res.send("Backend funcionando 🚀");
 });
+
+// ===============================
+// PREFLIGHT FIX
+// ===============================
+
+app.options("/apply-campaign", (req, res) => {
+
+  res.header("Access-Control-Allow-Origin", "*");
+
+  res.header(
+    "Access-Control-Allow-Headers",
+    "Origin, X-Requested-With, Content-Type, Accept, Authorization"
+  );
+
+  res.header(
+    "Access-Control-Allow-Methods",
+    "GET, POST, OPTIONS"
+  );
+
+  return res.sendStatus(200);
+
+});
+
+// ===============================
+// APPLY CAMPAIGN
+// ===============================
 
 app.post("/apply-campaign", async (req, res) => {
 
@@ -52,6 +78,7 @@ app.post("/apply-campaign", async (req, res) => {
     ok: true,
     message: "Campaña iniciada"
   });
+
 
   try {
     const {
