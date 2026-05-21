@@ -38,7 +38,7 @@ app.use(cors({
     "Authorization"
   ]
 }));
-app.options("*", cors());
+app.options(/.*/, cors());
 
 const limit = pLimit(3);
 // ===============================
