@@ -1,23 +1,41 @@
 const express = require("express");
 const axios = require("axios");
-const cors = require("cors");
 const pLimit = require("p-limit").default;
-
 const app = express();
 
-app.use(cors({
-  origin: true,
-  methods: ["GET", "POST", "OPTIONS"],
-  allowedHeaders: [
-    "Origin",
-    "X-Requested-With",
-    "Content-Type",
-    "Accept",
-    "Authorization"
-  ]
-}));
+app.use((req, res, next) => {
 
-app.options("*", cors());
+  const origin = req.headers.origin;
+
+  console.log("ORIGIN:", origin);
+
+  res.setHeader(
+    "Access-Control-Allow-Origin",
+    origin || "*"
+  );
+
+  res.setHeader(
+    "Access-Control-Allow-Headers",
+    "Origin, X-Requested-With, Content-Type, Accept, Authorization"
+  );
+
+  res.setHeader(
+    "Access-Control-Allow-Methods",
+    "GET, POST, OPTIONS"
+  );
+
+  res.setHeader(
+    "Access-Control-Allow-Credentials",
+    "true"
+  );
+
+  // responder preflight
+  if (req.method === "OPTIONS") {
+    return res.status(200).end();
+  }
+
+  next();
+});
 
 app.use(express.json({
   limit: "50mb"
