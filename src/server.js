@@ -1,4 +1,4 @@
-console.log("🔥 SERVER REAL CARGADO");
+
 
 const express = require("express");
 const axios = require("axios");
@@ -7,28 +7,38 @@ const pLimit = require("p-limit").default;
 
 const app = express();
 
-app.get("/test", (req, res) => {
-  console.log("🔥 ENTRÓ A /test");
-
-  res.json({
-    ok: true,
-    mensaje: "test funcionando"
-  });
-});
 app.use(cors({
-  origin: true,
+  origin: function(origin, callback) {
+
+    console.log("ORIGIN:", origin);
+
+    // permitir requests sin origin
+    if (!origin) {
+      return callback(null, true);
+    }
+
+    // permitir bitrix
+    if (
+      origin.includes("bitrix24") ||
+      origin.includes("railway.app")
+    ) {
+      return callback(null, true);
+    }
+
+    return callback(null, true);
+  },
+
   methods: ["GET", "POST", "OPTIONS"],
+
   allowedHeaders: [
     "Origin",
     "X-Requested-With",
     "Content-Type",
     "Accept",
     "Authorization"
-  ],
+  ]
 }));
-app.use(express.json({
-  limit: "50mb"
-}));
+app.options("*", cors());
 
 const limit = pLimit(3);
 // ===============================
