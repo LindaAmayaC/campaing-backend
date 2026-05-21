@@ -35,7 +35,7 @@ const limit = pLimit(3);
 // ===============================
 
 app.get("/", (req, res) => {
-  res.send("Backend funcionando 🚀");
+  res.send("Backend funcionando");
 });
 
 // ===============================
