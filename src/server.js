@@ -19,7 +19,7 @@ app.use((req, res, next) => {
 
   res.header(
     "Access-Control-Allow-Methods",
-    "GET, POST, PUT, DELETE, OPTIONS"
+    "GET, POST, OPTIONS"
   );
 
   if (req.method === "OPTIONS") {
@@ -30,7 +30,6 @@ app.use((req, res, next) => {
 
 });
 
-app.options(/.*/, cors());
 
 app.use(express.json({
   limit: "50mb"
