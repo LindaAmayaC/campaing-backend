@@ -1,5 +1,3 @@
-
-
 const express = require("express");
 const axios = require("axios");
 const cors = require("cors");
@@ -8,28 +6,8 @@ const pLimit = require("p-limit").default;
 const app = express();
 
 app.use(cors({
-  origin: function(origin, callback) {
-
-    console.log("ORIGIN:", origin);
-
-    // permitir requests sin origin
-    if (!origin) {
-      return callback(null, true);
-    }
-
-    // permitir bitrix
-    if (
-      origin.includes("bitrix24") ||
-      origin.includes("railway.app")
-    ) {
-      return callback(null, true);
-    }
-
-    return callback(null, true);
-  },
-
+  origin: true,
   methods: ["GET", "POST", "OPTIONS"],
-
   allowedHeaders: [
     "Origin",
     "X-Requested-With",
@@ -38,7 +16,12 @@ app.use(cors({
     "Authorization"
   ]
 }));
-app.options(/.*/, cors());
+
+app.options("*", cors());
+
+app.use(express.json({
+  limit: "50mb"
+}));
 
 const limit = pLimit(3);
 // ===============================
