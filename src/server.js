@@ -1,5 +1,4 @@
 const express = require("express");
-const cors = require("cors");
 const axios = require("axios");
 const pLimit = require("p-limit").default;
 
@@ -11,26 +10,28 @@ const app = express();
 
 app.use((req, res, next) => {
 
-  res.header(
+  res.setHeader(
     "Access-Control-Allow-Origin",
     "*"
   );
 
-  res.header(
+  res.setHeader(
     "Access-Control-Allow-Headers",
-    "Origin, X-Requested-With, Content-Type, Accept, Authorization"
+    "*"
   );
 
-  res.header(
+  res.setHeader(
     "Access-Control-Allow-Methods",
     "GET, POST, PUT, DELETE, OPTIONS"
   );
 
+  if (req.method === "OPTIONS") {
+    return res.status(200).end();
+  }
+
   next();
 
 });
-
-app.use(cors());
 
 app.use(express.json({
   limit: "50mb"
@@ -47,28 +48,6 @@ app.get("/", (req, res) => {
 });
 
 // ===============================
-// PREFLIGHT FIX
-// ===============================
-
-app.options("/apply-campaign", (req, res) => {
-
-  res.header("Access-Control-Allow-Origin", "*");
-
-  res.header(
-    "Access-Control-Allow-Headers",
-    "Origin, X-Requested-With, Content-Type, Accept, Authorization"
-  );
-
-  res.header(
-    "Access-Control-Allow-Methods",
-    "GET, POST, OPTIONS"
-  );
-
-  return res.sendStatus(200);
-
-});
-
-// ===============================
 // APPLY CAMPAIGN
 // ===============================
 
@@ -79,8 +58,8 @@ app.post("/apply-campaign", async (req, res) => {
     message: "Campaña iniciada"
   });
 
-
   try {
+
     const {
       contacts = [],
       token,
