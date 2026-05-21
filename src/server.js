@@ -51,6 +51,27 @@ app.get("/", (req, res) => {
 });
 
 // ===============================
+// HEALTH / DIAGNÓSTICO
+// Confirma sin exponer el valor si la env var WHATSAPP_TOKEN está cargada,
+// muestra cuántos caracteres tiene y un prefijo corto para detectar typos.
+// ===============================
+
+app.get("/health", (req, res) => {
+  const token = process.env.WHATSAPP_TOKEN || "";
+  res.json({
+    ok: true,
+    uptimeSec: Math.round(process.uptime()),
+    env: {
+      WHATSAPP_TOKEN_present: Boolean(token),
+      WHATSAPP_TOKEN_length: token.length,
+      WHATSAPP_TOKEN_prefix: token ? token.slice(0, 6) + "..." : null,
+      PORT: process.env.PORT || null,
+      NODE_ENV: process.env.NODE_ENV || null,
+    },
+  });
+});
+
+// ===============================
 // APPLY CAMPAIGN - WHATSAPP (relay)
 // ===============================
 //
