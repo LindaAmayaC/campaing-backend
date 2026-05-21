@@ -1,47 +1,40 @@
+
 const express = require("express");
 const axios = require("axios");
+const cors = require("cors");
 const pLimit = require("p-limit").default;
+
 const app = express();
 
-app.use((req, res, next) => {
+// ===============================
+// CORS BITRIX
+// ===============================
 
-  const origin = req.headers.origin;
+const corsOptions = {
+  origin: "https://viajesyviajes.bitrix24.es",
+  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+  allowedHeaders: [
+    "Content-Type",
+    "Authorization"
+  ],
+  credentials: true,
+};
 
-  console.log("ORIGIN:", origin);
+app.use(cors(corsOptions));
 
-  res.setHeader(
-    "Access-Control-Allow-Origin",
-    origin || "*"
-  );
+// responder preflight
+app.options("*", cors(corsOptions));
 
-  res.setHeader(
-    "Access-Control-Allow-Headers",
-    "Origin, X-Requested-With, Content-Type, Accept, Authorization"
-  );
-
-  res.setHeader(
-    "Access-Control-Allow-Methods",
-    "GET, POST, OPTIONS"
-  );
-
-  res.setHeader(
-    "Access-Control-Allow-Credentials",
-    "true"
-  );
-
-  // responder preflight
-  if (req.method === "OPTIONS") {
-    return res.status(200).end();
-  }
-
-  next();
-});
+// ===============================
+// JSON
+// ===============================
 
 app.use(express.json({
   limit: "50mb"
 }));
 
 const limit = pLimit(3);
+
 // ===============================
 // HOME
 // ===============================
@@ -55,21 +48,30 @@ app.get("/", (req, res) => {
 // ===============================
 
 app.post("/apply-campaign", async (req, res) => {
-  // RESPUESTA INMEDIATA
+
   res.json({
     ok: true,
     message: "Campaña iniciada",
   });
 
   try {
-    const { contacts = [], token, templateName, phoneNumberId } = req.body;
+
+    const {
+      contacts = [],
+      token,
+      templateName,
+      phoneNumberId
+    } = req.body;
 
     console.log(`Procesando ${contacts.length} contactos`);
 
     const jobs = contacts.map((contact) =>
       limit(async () => {
+
         await new Promise(r => setTimeout(r, 1500));
+
         try {
+
           await axios.post(
             `https://graph.facebook.com/v22.0/${phoneNumberId}/messages`,
             {
@@ -109,12 +111,15 @@ app.post("/apply-campaign", async (req, res) => {
           );
 
           console.log("OK:", contact.phone);
+
         } catch (err) {
+
           console.error(
             "ERROR:",
             contact.phone,
             err?.response?.data || err.message,
           );
+
         }
       }),
     );
@@ -122,6 +127,7 @@ app.post("/apply-campaign", async (req, res) => {
     await Promise.allSettled(jobs);
 
     console.log("Campaña finalizada");
+
   } catch (err) {
     console.error(err);
   }
