@@ -1,3 +1,4 @@
+console.log("🔥 SERVER REAL CARGADO");
 
 const express = require("express");
 const axios = require("axios");
@@ -6,6 +7,14 @@ const pLimit = require("p-limit").default;
 
 const app = express();
 
+app.get("/test", (req, res) => {
+  console.log("🔥 ENTRÓ A /test");
+
+  res.json({
+    ok: true,
+    mensaje: "test funcionando"
+  });
+});
 app.use(cors({
   origin: true,
   methods: ["GET", "POST", "OPTIONS"],
