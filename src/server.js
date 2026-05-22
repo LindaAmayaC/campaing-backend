@@ -103,6 +103,7 @@ app.get("/health", (req, res) => {
       WHATSAPP_TOKEN_length: token.length,
       WHATSAPP_TOKEN_prefix: token ? token.slice(0, 6) + "..." : null,
       WHATSAPP_WABA_ID_present: Boolean(process.env.WHATSAPP_WABA_ID),
+      WHATSAPP_PHONE_NUMBER_ID_present: Boolean(process.env.WHATSAPP_PHONE_NUMBER_ID),
       PORT: process.env.PORT || null,
       NODE_ENV: process.env.NODE_ENV || null,
     },
@@ -214,7 +215,10 @@ app.post("/apply-campaign/whatsapp", async (req, res) => {
       .json({ ok: false, error: "WHATSAPP_TOKEN no configurado en el servidor." });
   }
 
-  const { campaignId, phoneNumberId, messages } = req.body || {};
+  const { campaignId, messages } = req.body || {};
+  // phoneNumberId: prefiere env (recomendado); body solo como override.
+  const phoneNumberId =
+    process.env.WHATSAPP_PHONE_NUMBER_ID || req.body?.phoneNumberId || "";
 
   if (!campaignId || typeof campaignId !== "string") {
     return res
@@ -224,7 +228,10 @@ app.post("/apply-campaign/whatsapp", async (req, res) => {
   if (!phoneNumberId) {
     return res
       .status(400)
-      .json({ ok: false, error: "Falta phoneNumberId en el body." });
+      .json({
+        ok: false,
+        error: "Falta phoneNumberId (configura WHATSAPP_PHONE_NUMBER_ID en env).",
+      });
   }
   if (!Array.isArray(messages) || messages.length === 0) {
     return res
