@@ -186,7 +186,6 @@ setInterval(() => {
       purged += 1;
     }
   }
-  if (purged) console.log(`[idempotency] GC purgó ${purged} entradas`);
 }, 60 * 60 * 1000).unref();
 
 // ===============================
@@ -235,9 +234,6 @@ app.post("/apply-campaign/whatsapp", async (req, res) => {
 
   const url = `https://graph.facebook.com/v22.0/${encodeURIComponent(phoneNumberId)}/messages`;
 
-  console.log(
-    `[apply-campaign/whatsapp] campaña="${campaignId}" lote=${messages.length}`,
-  );
 
   const results = { ok: true, sent: 0, duplicates: 0, errors: [] };
 
@@ -279,9 +275,6 @@ app.post("/apply-campaign/whatsapp", async (req, res) => {
 
   await Promise.allSettled(jobs);
 
-  console.log(
-    `[apply-campaign/whatsapp] fin campaña="${campaignId}": ${results.sent} ok, ${results.duplicates} duplicados, ${results.errors.length} errores`,
-  );
 
   res.json(results);
 });
@@ -289,5 +282,4 @@ app.post("/apply-campaign/whatsapp", async (req, res) => {
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
-  console.log("Servidor iniciado en puerto", PORT);
 });
