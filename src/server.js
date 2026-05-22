@@ -5,7 +5,23 @@ const axios = require("axios");
 const cors = require("cors");
 const pLimit = require("p-limit").default;
 
+const logger = require("./lib/logger");
+const metrics = require("./lib/metrics");
+
 const app = express();
+
+// Captura excepciones no manejadas y promesas rechazadas. Sin esto, una
+// excepción asíncrona puede tumbar el proceso silenciosamente en Railway.
+process.on("uncaughtException", (err) => {
+  logger.error("uncaughtException", { error: err?.message, stack: err?.stack });
+  metrics.inc("uncaughtException");
+});
+process.on("unhandledRejection", (reason) => {
+  logger.error("unhandledRejection", {
+    reason: reason?.message || String(reason),
+  });
+  metrics.inc("unhandledRejection");
+});
 
 // ===============================
 // CORS BITRIX
@@ -23,7 +39,8 @@ const corsOptions = {
     if (!origin) return callback(null, true); // peticiones server-to-server o curl
     const ok = allowedOriginPatterns.some((re) => re.test(origin));
     if (ok) return callback(null, true);
-    console.warn("[CORS] Origin no permitido:", origin);
+    logger.warn("cors.rejected", { origin });
+    metrics.inc("cors.rejected");
     return callback(new Error("Origin no permitido: " + origin));
   },
   methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
@@ -83,8 +100,35 @@ async function postToMetaWithRetry(url, payload, token) {
 // HOME
 // ===============================
 
+// Middleware de logging de request (ligero, sin body).
+app.use((req, res, next) => {
+  const t0 = Date.now();
+  res.on("finish", () => {
+    metrics.inc(`http.${res.statusCode}`);
+    if (req.path !== "/health") {
+      logger.info("http", {
+        method: req.method,
+        path: req.path,
+        status: res.statusCode,
+        durMs: Date.now() - t0,
+      });
+    }
+  });
+  next();
+});
+
 app.get("/", (req, res) => {
   res.send("Backend funcionando");
+});
+
+// Métricas en memoria (no persistentes, se resetean por deploy).
+app.get("/metrics", (req, res) => {
+  res.json({
+    ok: true,
+    uptimeSec: Math.round(process.uptime()),
+    memMB: Math.round(process.memoryUsage().rss / 1024 / 1024),
+    counters: metrics.snapshot(),
+  });
 });
 
 // ===============================
@@ -145,7 +189,8 @@ app.get("/whatsapp/templates", async (req, res) => {
       err?.response?.data?.error?.message ||
       err?.message ||
       "Error consultando plantillas";
-    console.error("[whatsapp/templates] error:", msg);
+    logger.error("templates.failed", { status, msg });
+    metrics.inc("templates.failed");
     return res.status(status).json({ ok: false, error: msg });
   }
 });
@@ -234,6 +279,7 @@ app.post("/apply-campaign/whatsapp", async (req, res) => {
 
   const url = `https://graph.facebook.com/v22.0/${encodeURIComponent(phoneNumberId)}/messages`;
 
+  logger.info("wa.batch.start", { campaignId, batchSize: messages.length });
 
   const results = { ok: true, sent: 0, duplicates: 0, errors: [] };
 
@@ -250,12 +296,14 @@ app.post("/apply-campaign/whatsapp", async (req, res) => {
       // Idempotencia: si ya se envió este teléfono en esta campaña, saltar.
       if (alreadySent(campaignId, to)) {
         results.duplicates += 1;
+        metrics.inc("wa.duplicate");
         return;
       }
 
       const r = await postToMetaWithRetry(url, payload, token);
       if (r.ok) {
         results.sent += 1;
+        metrics.inc("wa.sent");
         markSent(campaignId, to);
       } else {
         const err = r.err;
@@ -268,13 +316,24 @@ app.post("/apply-campaign/whatsapp", async (req, res) => {
         results.errors.push(
           `(${to}) ${typeof errMsg === "string" ? errMsg : JSON.stringify(errMsg)}`,
         );
-        console.error("ERROR:", to, errMsg);
+        metrics.inc("wa.failed");
+        logger.error("wa.failed", {
+          to,
+          status: err?.response?.status,
+          error: typeof errMsg === "string" ? errMsg : JSON.stringify(errMsg),
+        });
       }
     }),
   );
 
   await Promise.allSettled(jobs);
 
+  logger.info("wa.batch.done", {
+    campaignId,
+    sent: results.sent,
+    duplicates: results.duplicates,
+    errors: results.errors.length,
+  });
 
   res.json(results);
 });
@@ -282,4 +341,8 @@ app.post("/apply-campaign/whatsapp", async (req, res) => {
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
+  logger.info("server.started", {
+    port: Number(PORT),
+    nodeEnv: process.env.NODE_ENV || null,
+  });
 });
