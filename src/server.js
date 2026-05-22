@@ -189,6 +189,80 @@ setInterval(() => {
 }, 60 * 60 * 1000).unref();
 
 // ===============================
+// APPLY CAMPAIGN - SMS (relay a Onmall / messaging-service)
+// ===============================
+//
+// Espera body:
+// {
+//   mensaje: "texto",
+//   destinos: ["57XXXXXXXXXX", ...],
+//   sendAt: "2026-05-21T10:00:00.000-05:00"  // opcional
+// }
+//
+// Credenciales en process.env.ONMALL_AUTH (formato "Basic <base64>").
+// process.env.ONMALL_FROM define el remitente; default "CompanyName".
+
+app.post("/apply-campaign/sms", async (req, res) => {
+  const onmallAuth = process.env.ONMALL_AUTH;
+  if (!onmallAuth) {
+    return res
+      .status(500)
+      .json({ ok: false, error: "ONMALL_AUTH no configurado en el servidor." });
+  }
+
+  const { mensaje, destinos, sendAt } = req.body || {};
+  if (!mensaje || typeof mensaje !== "string") {
+    return res
+      .status(400)
+      .json({ ok: false, error: "Falta mensaje (string) en el body." });
+  }
+  if (!Array.isArray(destinos) || destinos.length === 0) {
+    return res
+      .status(400)
+      .json({ ok: false, error: "destinos debe ser un array no vacío." });
+  }
+
+  const payload = {
+    messages: [
+      {
+        from: process.env.ONMALL_FROM || "CompanyName",
+        destinations: destinos.map((to) => ({ to: String(to) })),
+        text: mensaje,
+        ...(sendAt ? { sendAt } : {}),
+      },
+    ],
+  };
+
+  try {
+    const r = await axios.post(
+      "https://api.messaging-service.com/sms/1/text/advanced",
+      payload,
+      {
+        headers: {
+          accept: "application/json",
+          "content-type": "application/json",
+          authorization: onmallAuth.startsWith("Basic ")
+            ? onmallAuth
+            : `Basic ${onmallAuth}`,
+        },
+        timeout: 20000,
+      },
+    );
+    console.log(`[apply-campaign/sms] enviados ${destinos.length} destinos`);
+    return res.json({ ok: true, sent: destinos.length, data: r.data });
+  } catch (err) {
+    const status = err?.response?.status || 500;
+    const msg =
+      err?.response?.data?.requestError?.serviceException?.text ||
+      err?.response?.data?.error ||
+      err?.message ||
+      "Error enviando SMS";
+    console.error("[apply-campaign/sms] error:", msg);
+    return res.status(status).json({ ok: false, error: msg });
+  }
+});
+
+// ===============================
 // APPLY CAMPAIGN - WHATSAPP (relay)
 // ===============================
 //
