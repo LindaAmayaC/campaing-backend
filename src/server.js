@@ -3,9 +3,25 @@ require("dotenv").config();
 const express = require("express");
 const axios = require("axios");
 const cors = require("cors");
+const https = require("https");
 const pLimit = require("p-limit").default;
 
 const app = express();
+
+// Agent HTTPS con keep-alive: reutiliza la conexión TCP/TLS hacia Meta
+// entre los miles de POST de una campaña. Sin esto, axios negocia un
+// handshake nuevo por cada mensaje (~50-80ms extra).
+const keepAliveAgent = new https.Agent({
+  keepAlive: true,
+  keepAliveMsecs: 30000,
+  maxSockets: 50,
+  maxFreeSockets: 20,
+});
+
+const metaAxios = axios.create({
+  httpsAgent: keepAliveAgent,
+  timeout: 20000,
+});
 
 // ===============================
 // CORS BITRIX
@@ -85,12 +101,11 @@ async function postToMetaWithRetry(url, payload, token) {
   let attempt = 0;
   while (true) {
     try {
-      await axios.post(url, payload, {
+      await metaAxios.post(url, payload, {
         headers: {
           Authorization: `Bearer ${token}`,
           "Content-Type": "application/json",
         },
-        timeout: 20000,
       });
       return { ok: true };
     } catch (err) {
@@ -161,7 +176,7 @@ app.get("/whatsapp/templates", async (req, res) => {
   )}/message_templates?fields=name,status,language,category,components&limit=50`;
 
   try {
-    const r = await axios.get(url, {
+    const r = await metaAxios.get(url, {
       headers: { Authorization: `Bearer ${token}` },
       timeout: 15000,
     });
