@@ -3,10 +3,16 @@ require("dotenv").config();
 const express = require("express");
 const axios = require("axios");
 const cors = require("cors");
+const compression = require("compression");
 const https = require("https");
 const pLimit = require("p-limit").default;
 
 const app = express();
+
+// Comprime respuestas JSON > 1KB con gzip/brotli (según lo que mande el
+// cliente en Accept-Encoding). Útil sobre todo para el reporte de envío
+// y la lista de plantillas, que pueden traer varios KB.
+app.use(compression());
 
 // Agent HTTPS con keep-alive: reutiliza la conexión TCP/TLS hacia Meta
 // entre los miles de POST de una campaña. Sin esto, axios negocia un
