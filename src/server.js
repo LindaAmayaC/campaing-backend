@@ -3,9 +3,15 @@ require("dotenv").config();
 const express = require("express");
 const axios = require("axios");
 const cors = require("cors");
+const compression = require("compression");
 const pLimit = require("p-limit").default;
 
 const app = express();
+
+// Comprime respuestas JSON > 1KB con gzip/brotli (según lo que mande el
+// cliente en Accept-Encoding). Útil sobre todo para el reporte de envío
+// y la lista de plantillas, que pueden traer varios KB.
+app.use(compression());
 
 // ===============================
 // CORS BITRIX
