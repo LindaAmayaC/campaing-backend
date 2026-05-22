@@ -40,6 +40,32 @@ app.options("*", cors(corsOptions));
 
 app.use(express.json({ limit: "50mb" }));
 
+// ===============================
+// AUTH POR API KEY
+// Protege los endpoints que cuestan dinero (envío Meta) o exponen plantillas.
+// Acepta X-Api-Key o Authorization: Bearer <key>.
+// Si API_SECRET no está configurada en env, la auth queda OFF (modo dev).
+// ===============================
+
+const API_SECRET = process.env.API_SECRET || "";
+const PROTECTED_PREFIXES = ["/apply-campaign/", "/whatsapp/"];
+
+function requireApiKey(req, res, next) {
+  if (!API_SECRET) return next(); // sin secret configurado → pasa (dev)
+  const isProtected = PROTECTED_PREFIXES.some((p) => req.path.startsWith(p));
+  if (!isProtected) return next();
+
+  const headerKey =
+    req.get("X-Api-Key") ||
+    (req.get("Authorization") || "").replace(/^Bearer\s+/i, "").trim();
+
+  if (headerKey && headerKey === API_SECRET) return next();
+  console.warn("[Auth] Petición rechazada en", req.path, "ip", req.ip);
+  return res.status(401).json({ ok: false, error: "Unauthorized" });
+}
+
+app.use(requireApiKey);
+
 // Concurrencia hacia Meta. Meta permite ~80 msg/seg por número;
 // 15 paralelos con latencia ~300ms dan ~50 msg/seg, margen seguro.
 const limit = pLimit(15);
@@ -103,6 +129,7 @@ app.get("/health", (req, res) => {
       WHATSAPP_TOKEN_length: token.length,
       WHATSAPP_TOKEN_prefix: token ? token.slice(0, 6) + "..." : null,
       WHATSAPP_WABA_ID_present: Boolean(process.env.WHATSAPP_WABA_ID),
+      API_SECRET_present: Boolean(process.env.API_SECRET),
       PORT: process.env.PORT || null,
       NODE_ENV: process.env.NODE_ENV || null,
     },
