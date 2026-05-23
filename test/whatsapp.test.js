@@ -1,47 +1,93 @@
 const {
+  normalizeWhatsappRecipient,
   normalizeWhatsappRecipientColombia,
   getTemplateBodyText,
   buildTemplateParameters,
 } = require("../src/lib/whatsapp");
 
-describe("normalizeWhatsappRecipientColombia", () => {
+describe("normalizeWhatsappRecipient — Colombia (compatibilidad)", () => {
   test("acepta 12 dígitos empezando por 57", () => {
-    expect(normalizeWhatsappRecipientColombia("573001234567")).toBe("573001234567");
+    expect(normalizeWhatsappRecipient("573001234567")).toBe("573001234567");
   });
 
   test("prefija 57 al móvil de 10 dígitos empezando por 3", () => {
-    expect(normalizeWhatsappRecipientColombia("3001234567")).toBe("573001234567");
+    expect(normalizeWhatsappRecipient("3001234567")).toBe("573001234567");
   });
 
   test("acepta formato +57 con espacios y guiones", () => {
+    expect(normalizeWhatsappRecipient("+57 300 123 4567")).toBe("573001234567");
+    expect(normalizeWhatsappRecipient("+57-300-1234567")).toBe("573001234567");
+  });
+
+  test("alias legacy normalizeWhatsappRecipientColombia sigue funcionando", () => {
+    expect(normalizeWhatsappRecipientColombia("3001234567")).toBe("573001234567");
     expect(normalizeWhatsappRecipientColombia("+57 300 123 4567")).toBe("573001234567");
-    expect(normalizeWhatsappRecipientColombia("+57-300-1234567")).toBe("573001234567");
+  });
+});
+
+describe("normalizeWhatsappRecipient — internacional", () => {
+  test("acepta US/Canada con +1 (separadores varios)", () => {
+    expect(normalizeWhatsappRecipient("+1 (202) 555-1234")).toBe("12025551234");
+    expect(normalizeWhatsappRecipient("+1-202-555-1234")).toBe("12025551234");
   });
 
+  test("acepta US/Canada en E.164 sin + (11 dígitos empezando por 1)", () => {
+    expect(normalizeWhatsappRecipient("12025551234")).toBe("12025551234");
+  });
+
+  test("acepta México con +52", () => {
+    expect(normalizeWhatsappRecipient("+52 55 1234 5678")).toBe("525512345678");
+    expect(normalizeWhatsappRecipient("525512345678")).toBe("525512345678");
+  });
+
+  test("acepta España con +34", () => {
+    expect(normalizeWhatsappRecipient("+34 612 345 678")).toBe("34612345678");
+  });
+
+  test("acepta UK con +44", () => {
+    expect(normalizeWhatsappRecipient("+44 7400 123456")).toBe("447400123456");
+  });
+
+  test("acepta Brasil con +55 incluyendo guión", () => {
+    expect(normalizeWhatsappRecipient("+55 11 91234-5678")).toBe("5511912345678");
+  });
+});
+
+describe("normalizeWhatsappRecipient — rechazos", () => {
   test("rechaza vacío, null, undefined", () => {
-    expect(normalizeWhatsappRecipientColombia("")).toBe("");
-    expect(normalizeWhatsappRecipientColombia(null)).toBe("");
-    expect(normalizeWhatsappRecipientColombia(undefined)).toBe("");
+    expect(normalizeWhatsappRecipient("")).toBe("");
+    expect(normalizeWhatsappRecipient(null)).toBe("");
+    expect(normalizeWhatsappRecipient(undefined)).toBe("");
   });
 
-  test("rechaza menos de 10 dígitos", () => {
-    expect(normalizeWhatsappRecipientColombia("300123")).toBe("");
-    expect(normalizeWhatsappRecipientColombia("3001234")).toBe("");
+  test("rechaza con + pero menos de 8 dígitos", () => {
+    expect(normalizeWhatsappRecipient("+574567")).toBe("");
+    expect(normalizeWhatsappRecipient("+1 234")).toBe("");
   });
 
-  test("rechaza 10 dígitos que no empiezan por 3", () => {
-    expect(normalizeWhatsappRecipientColombia("1234567890")).toBe("");
-    expect(normalizeWhatsappRecipientColombia("4001234567")).toBe("");
+  test("rechaza con + pero más de 15 dígitos", () => {
+    expect(normalizeWhatsappRecipient("+1234567890123456")).toBe("");
   });
 
-  test("rechaza otros prefijos de país", () => {
-    expect(normalizeWhatsappRecipientColombia("5912345678901")).toBe("");
-    expect(normalizeWhatsappRecipientColombia("13001234567")).toBe("");
+  test("rechaza 10 dígitos sin + que no empiezan por 3 (ambiguo)", () => {
+    // Podría ser US local (sin código país) o cualquier otro: no asumimos nada.
+    expect(normalizeWhatsappRecipient("1234567890")).toBe("");
+    expect(normalizeWhatsappRecipient("2125551234")).toBe("");
+    expect(normalizeWhatsappRecipient("4001234567")).toBe("");
   });
 
-  test("rechaza letras o basura", () => {
-    expect(normalizeWhatsappRecipientColombia("abc")).toBe("");
-    expect(normalizeWhatsappRecipientColombia("300abc1234")).toBe("");
+  test("rechaza menos de 10 dígitos sin +", () => {
+    expect(normalizeWhatsappRecipient("300123")).toBe("");
+    expect(normalizeWhatsappRecipient("3001234")).toBe("");
+  });
+
+  test("rechaza letras o basura sin + ni dígitos", () => {
+    expect(normalizeWhatsappRecipient("abc")).toBe("");
+  });
+
+  test("limpia separadores pero respeta la longitud mínima", () => {
+    // "300abc1234" → digitsOnly "3001234" (7 dígitos, no 10) → rechazado.
+    expect(normalizeWhatsappRecipient("300abc1234")).toBe("");
   });
 });
 

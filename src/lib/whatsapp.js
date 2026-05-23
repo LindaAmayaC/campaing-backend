@@ -2,22 +2,42 @@
 // Aisladas para poder testearlas sin depender del DOM ni de Express.
 
 /**
- * Normaliza un teléfono a formato Colombia para WhatsApp Cloud API:
- * "57" + 10 dígitos nacionales. Devuelve "" si no es válido.
+ * Normaliza un teléfono para WhatsApp Cloud API. Devuelve solo dígitos
+ * (formato E.164 sin el "+"). Acepta cualquier país siempre que el formato
+ * sea claro. Devuelve "" si no se puede determinar inequívocamente.
+ *
+ * Reglas (en orden):
+ *  1. Con "+": confiamos en el código de país, validamos 8-15 dígitos.
+ *  2. Sin "+", 10 dígitos empezando por 3: Colombia → prefijamos 57.
+ *  3. Sin "+", 11-15 dígitos: asumimos que ya incluye código de país.
+ *  4. Cualquier otro caso: vacío.
  */
-function normalizeWhatsappRecipientColombia(phone) {
+function normalizeWhatsappRecipient(phone) {
   const trimmed = String(phone || "").trim();
+  if (!trimmed) return "";
+
+  if (trimmed.startsWith("+")) {
+    const digits = trimmed.slice(1).replace(/\D/g, "");
+    if (digits.length >= 8 && digits.length <= 15) return digits;
+    return "";
+  }
+
   const digitsOnly = trimmed.replace(/\D/g, "");
 
-  if (digitsOnly.length === 12 && digitsOnly.startsWith("57")) return digitsOnly;
   if (digitsOnly.length === 10 && /^3\d{9}$/.test(digitsOnly)) {
     return "57" + digitsOnly;
   }
-  if (/^\+57\d{10}$/.test(trimmed)) {
-    return "57" + trimmed.slice(3).replace(/\D/g, "");
+
+  if (digitsOnly.length >= 11 && digitsOnly.length <= 15) {
+    return digitsOnly;
   }
+
   return "";
 }
+
+// Alias legacy: el normalizador anterior era específico de Colombia.
+// La nueva versión cubre todos los casos previos y añade soporte internacional.
+const normalizeWhatsappRecipientColombia = normalizeWhatsappRecipient;
 
 /**
  * Lee el texto del componente BODY de una plantilla de Meta.
@@ -65,7 +85,8 @@ function buildTemplateParameters(bodyText, contactName, campanaNombre) {
 }
 
 module.exports = {
-  normalizeWhatsappRecipientColombia,
+  normalizeWhatsappRecipient,
+  normalizeWhatsappRecipientColombia, // alias legacy
   getTemplateBodyText,
   buildTemplateParameters,
 };
