@@ -13,6 +13,7 @@
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
+    "@aws-sdk/client-sesv2": "^3.1063.0",
     "axios": "^1.16.1",
     "compression": "^1.8.1",
     "cors": "^2.8.6",

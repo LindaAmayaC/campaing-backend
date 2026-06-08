@@ -9,6 +9,7 @@ const pLimit = require("p-limit").default;
 
 const logger = require("./lib/logger");
 const metrics = require("./lib/metrics");
+const { sendOneEmail } = require("./lib/ses");
 
 const app = express();
 
@@ -197,6 +198,10 @@ app.get("/health", (req, res) => {
       WHATSAPP_WABA_ID_present: Boolean(process.env.WHATSAPP_WABA_ID),
       WHATSAPP_PHONE_NUMBER_ID_present: Boolean(process.env.WHATSAPP_PHONE_NUMBER_ID),
       API_SECRET_present: Boolean(process.env.API_SECRET),
+      AWS_REGION_present: Boolean(process.env.AWS_REGION),
+      AWS_ACCESS_KEY_ID_present: Boolean(process.env.AWS_ACCESS_KEY_ID),
+      AWS_SECRET_ACCESS_KEY_present: Boolean(process.env.AWS_SECRET_ACCESS_KEY),
+      SES_DEFAULT_FROM_present: Boolean(process.env.SES_DEFAULT_FROM),
       PORT: process.env.PORT || null,
       NODE_ENV: process.env.NODE_ENV || null,
     },
@@ -462,6 +467,122 @@ app.post("/apply-campaign/whatsapp", async (req, res) => {
     campaignId,
     sent: results.sent,
     duplicates: results.duplicates,
+    errors: results.errors.length,
+  });
+
+  res.json(results);
+});
+
+// ===============================
+// APPLY CAMPAIGN - EMAIL (relay a Amazon SES v2)
+// ===============================
+//
+// Espera body:
+// {
+//   campaignId: "Verano2026-2026-06-07",
+//   from: "no-reply@viajesyviajes.com",   // opcional, default SES_DEFAULT_FROM
+//   subject: "Asunto",
+//   html: "<p>Cuerpo HTML</p>",           // html y/o text (al menos uno)
+//   text: "Cuerpo plano",                 // opcional
+//   replyTo: "ventas@viajesyviajes.com",  // opcional
+//   destinos: ["a@b.com", "c@d.com", ...]
+// }
+//
+// Credenciales SES en env:
+//   AWS_REGION, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, SES_DEFAULT_FROM
+//
+// Concurrencia limitada a 10 paralelos (SES en producción permite ~14/s).
+// Si un envío falla, los demás continúan; el error se reporta en errors[].
+// Idempotencia por (campaignId|email) reutilizando el sentCache.
+
+const emailLimit = pLimit(10);
+
+app.post("/apply-campaign/email", async (req, res) => {
+  if (!process.env.AWS_ACCESS_KEY_ID || !process.env.AWS_SECRET_ACCESS_KEY) {
+    return res.status(500).json({
+      ok: false,
+      error: "AWS credentials no configuradas en el servidor.",
+    });
+  }
+  if (!process.env.SES_DEFAULT_FROM && !req.body?.from) {
+    return res.status(500).json({
+      ok: false,
+      error: "SES_DEFAULT_FROM no configurado y no llegó 'from' en el body.",
+    });
+  }
+
+  const { campaignId, from, subject, html, text, replyTo, destinos } = req.body || {};
+
+  if (!campaignId || typeof campaignId !== "string") {
+    return res
+      .status(400)
+      .json({ ok: false, error: "Falta campaignId (string) en el body." });
+  }
+  if (!subject || typeof subject !== "string") {
+    return res
+      .status(400)
+      .json({ ok: false, error: "Falta subject (string) en el body." });
+  }
+  if (!html && !text) {
+    return res
+      .status(400)
+      .json({ ok: false, error: "Debes incluir 'html' y/o 'text'." });
+  }
+  if (!Array.isArray(destinos) || destinos.length === 0) {
+    return res
+      .status(400)
+      .json({ ok: false, error: "destinos debe ser un array no vacío." });
+  }
+
+  logger.info("email.batch.start", { campaignId, batchSize: destinos.length });
+
+  const results = {
+    ok: true,
+    sent: 0,
+    duplicates: 0,
+    rejected: 0,
+    errors: [],
+    messageIds: [],
+  };
+
+  const jobs = destinos.map((to) =>
+    emailLimit(async () => {
+      const dest = String(to || "").trim();
+      if (!dest) {
+        results.errors.push("(vacio) destino vacío");
+        results.rejected += 1;
+        return;
+      }
+      // Idempotencia: misma campaña + mismo correo no se reenvía.
+      if (alreadySent(campaignId, dest)) {
+        results.duplicates += 1;
+        metrics.inc("email.duplicate");
+        return;
+      }
+
+      const r = await sendOneEmail({ from, to: dest, subject, html, text, replyTo });
+      if (r.ok) {
+        results.sent += 1;
+        results.messageIds.push(r.messageId);
+        metrics.inc("email.sent");
+        markSent(campaignId, dest);
+      } else {
+        results.ok = false;
+        results.rejected += 1;
+        results.errors.push(`(${dest}) ${r.error || r.code || "Error SES"}`);
+        metrics.inc("email.failed");
+        logger.error("email.failed", { to: dest, code: r.code, error: r.error });
+      }
+    }),
+  );
+
+  await Promise.allSettled(jobs);
+
+  logger.info("email.batch.done", {
+    campaignId,
+    sent: results.sent,
+    duplicates: results.duplicates,
+    rejected: results.rejected,
     errors: results.errors.length,
   });
 
