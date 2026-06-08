@@ -1,37 +1,35 @@
 /*
  * src/lib/ses.js
- * Cliente Amazon SES para campañas de correo.
+ * Cliente Amazon SES para campañas de correo con CID inline.
  *
  * Arquitectura:
- *   nodemailer (stream transport)  →  construye el MIME multipart
- *           ↓                         (incluye attachments inline con CID)
- *   buffer del raw MIME
- *           ↓
- *   SES v2 SendEmailCommand con Content.Raw  →  envía
+ *   Frontend → HTML con <img src="data:image/...">
+ *       ↓
+ *   extractInlineImages: data: → cid:imgN + buffer separado
+ *       ↓
+ *   buildMimeRaw: arma multipart/alternative > multipart/related con
+ *                 la estructura EXACTA que usan Mailchimp/Sendgrid (sin
+ *                 filename/name params que confunden a Gmail).
+ *       ↓
+ *   SES v2 SendEmailCommand con Content.Raw
  *
- * Por qué este split: nodemailer es la herramienta estándar para armar
- * multipart MIME correcto con inline CID, pero su SES transport directo
- * solo soporta SES v1 (cliente legacy). Usándolo como stream-builder y
- * mandando el raw via SES v2, obtenemos lo mejor de ambos.
- *
- * IMPORTANTE: este módulo extrae automáticamente <img src="data:image/...">
- * del HTML y los convierte a adjuntos inline (cid:imgN). Esto es lo que
- * permite que Gmail, Outlook, Apple Mail rendericen las imágenes pegadas
- * por el cliente — base64 inline es bloqueado por Gmail desde 2014.
+ * Por qué no nodemailer: nodemailer siempre agrega filename y name a las
+ * partes de imagen aunque no se los pidas. Gmail trata cualquier parte
+ * con filename como adjunto descargable y NO renderiza el cid: en el HTML.
+ * Por eso construimos el MIME a mano.
  *
  * Credenciales en process.env: AWS_REGION, AWS_ACCESS_KEY_ID,
  * AWS_SECRET_ACCESS_KEY, SES_DEFAULT_FROM.
  */
 "use strict";
 
+const crypto = require("crypto");
 const {
   SESv2Client,
   SendEmailCommand,
 } = require("@aws-sdk/client-sesv2");
-const nodemailer = require("nodemailer");
 
 let _sesClient = null;
-let _mimeBuilder = null;
 
 function getSesClient() {
   if (_sesClient) return _sesClient;
@@ -47,22 +45,10 @@ function getSesClient() {
   return _sesClient;
 }
 
-function getMimeBuilder() {
-  if (_mimeBuilder) return _mimeBuilder;
-  // streamTransport=true hace que nodemailer NO envíe, solo construya
-  // el MIME y lo entregue como stream. Ideal para delegar el send a SES.
-  _mimeBuilder = nodemailer.createTransport({
-    streamTransport: true,
-    newline: "unix",
-    buffer: true, // pedimos buffer en vez de stream → más fácil de manejar
-  });
-  return _mimeBuilder;
-}
-
 /**
  * Extrae <img src="data:image/...;base64,..."> del HTML y los reemplaza
- * por <img src="cid:imgN">, devolviendo además el array de adjuntos inline
- * en el formato que nodemailer espera.
+ * por <img src="cid:imgN">. Devuelve también la lista de attachments con
+ * cid, contentType y buffer.
  */
 function extractInlineImages(html) {
   if (typeof html !== "string" || !html.includes("data:image")) {
@@ -78,7 +64,10 @@ function extractInlineImages(html) {
     dataUrlRegex,
     (_match, before, _fullDataUrl, mime, b64, after) => {
       counter += 1;
-      const cid = `img-${counter}-${Date.now().toString(36)}`;
+      // CID estilo Mailchimp: id corto + dominio fake. Gmail acepta este
+      // formato sin problemas. No usar guiones medios largos porque
+      // algunos parsers antiguos los rompen.
+      const cid = `img${counter}.${Date.now().toString(36)}@viajesyviajes`;
       const cleanB64 = String(b64).replace(/\s+/g, "");
       let buffer;
       try {
@@ -88,10 +77,8 @@ function extractInlineImages(html) {
       }
       attachments.push({
         cid,
-        filename: `inline-${counter}.${normalizeExt(mime)}`,
-        content: buffer,
         contentType: `image/${normalizeExt(mime)}`,
-        contentDisposition: "inline",
+        buffer,
       });
       return `<img${before}src="cid:${cid}"${after}>`;
     },
@@ -110,31 +97,150 @@ function normalizeExt(mime) {
   return "jpeg";
 }
 
+function randomBoundary(label) {
+  return `${label}_${crypto.randomBytes(12).toString("hex")}`;
+}
+
 /**
- * Construye el raw MIME del correo usando nodemailer.
- * Devuelve un Buffer listo para SES.SendEmailCommand con Content.Raw.
+ * Codifica un header en MIME-encoded-word (RFC 2047) si contiene
+ * caracteres no-ASCII. Necesario para Subject y From con tildes/emojis.
  */
-function buildRawMime(mailOptions) {
-  return new Promise((resolve, reject) => {
-    getMimeBuilder().sendMail(mailOptions, (err, info) => {
-      if (err) return reject(err);
-      if (!info?.message) return reject(new Error("nodemailer no devolvió message buffer"));
-      resolve(info.message);
-    });
-  });
+function encodeHeader(value) {
+  const s = String(value || "");
+  // eslint-disable-next-line no-control-regex
+  if (/^[\x00-\x7F]*$/.test(s)) return s;
+  return `=?UTF-8?B?${Buffer.from(s, "utf8").toString("base64")}?=`;
+}
+
+/**
+ * Wrap base64 cada 76 chars con CRLF (RFC 2045).
+ */
+function wrapBase64(b64) {
+  const lines = [];
+  for (let i = 0; i < b64.length; i += 76) {
+    lines.push(b64.slice(i, i + 76));
+  }
+  return lines.join("\r\n");
+}
+
+/**
+ * Construye el raw MIME del correo a mano, con control total sobre los
+ * headers de cada parte. Replicamos el patrón que usan Mailchimp/Sendgrid
+ * (sin filename ni name params en las partes de imagen).
+ */
+function buildMimeRaw({ from, to, subject, text, html, replyTo, attachments }) {
+  const altBoundary = randomBoundary("alt");
+  const relBoundary = randomBoundary("rel");
+  const CRLF = "\r\n";
+  const lines = [];
+
+  // Headers principales del correo.
+  lines.push(`From: ${encodeHeader(from)}`);
+  lines.push(`To: ${to}`);
+  lines.push(`Subject: ${encodeHeader(subject)}`);
+  if (replyTo) lines.push(`Reply-To: ${replyTo}`);
+  lines.push("MIME-Version: 1.0");
+
+  const hasInline = Array.isArray(attachments) && attachments.length > 0;
+  const hasText = Boolean(text);
+  const hasHtml = Boolean(html);
+
+  if (hasText && hasHtml) {
+    lines.push(
+      `Content-Type: multipart/alternative; boundary="${altBoundary}"`,
+    );
+    lines.push("");
+
+    // text/plain
+    lines.push(`--${altBoundary}`);
+    lines.push("Content-Type: text/plain; charset=utf-8");
+    lines.push("Content-Transfer-Encoding: 7bit");
+    lines.push("");
+    lines.push(text);
+    lines.push("");
+
+    if (hasInline) {
+      // multipart/related con html + imágenes inline
+      lines.push(`--${altBoundary}`);
+      lines.push(
+        `Content-Type: multipart/related; boundary="${relBoundary}"`,
+      );
+      lines.push("");
+
+      lines.push(`--${relBoundary}`);
+      lines.push("Content-Type: text/html; charset=utf-8");
+      lines.push("Content-Transfer-Encoding: 7bit");
+      lines.push("");
+      lines.push(html);
+      lines.push("");
+
+      for (const att of attachments) {
+        lines.push(`--${relBoundary}`);
+        // Ojo: sin name=, sin filename=, sin Content-Disposition con
+        // filename. Solo lo estrictamente necesario.
+        lines.push(`Content-Type: ${att.contentType}`);
+        lines.push(`Content-Transfer-Encoding: base64`);
+        lines.push(`Content-ID: <${att.cid}>`);
+        lines.push(`Content-Disposition: inline`);
+        lines.push("");
+        lines.push(wrapBase64(att.buffer.toString("base64")));
+        lines.push("");
+      }
+      lines.push(`--${relBoundary}--`);
+      lines.push("");
+    } else {
+      // Solo HTML, sin imágenes
+      lines.push(`--${altBoundary}`);
+      lines.push("Content-Type: text/html; charset=utf-8");
+      lines.push("Content-Transfer-Encoding: 7bit");
+      lines.push("");
+      lines.push(html);
+      lines.push("");
+    }
+
+    lines.push(`--${altBoundary}--`);
+    lines.push("");
+  } else if (hasHtml && hasInline) {
+    // Solo HTML + imágenes, sin text/plain.
+    lines.push(
+      `Content-Type: multipart/related; boundary="${relBoundary}"`,
+    );
+    lines.push("");
+    lines.push(`--${relBoundary}`);
+    lines.push("Content-Type: text/html; charset=utf-8");
+    lines.push("Content-Transfer-Encoding: 7bit");
+    lines.push("");
+    lines.push(html);
+    lines.push("");
+    for (const att of attachments) {
+      lines.push(`--${relBoundary}`);
+      lines.push(`Content-Type: ${att.contentType}`);
+      lines.push(`Content-Transfer-Encoding: base64`);
+      lines.push(`Content-ID: <${att.cid}>`);
+      lines.push(`Content-Disposition: inline`);
+      lines.push("");
+      lines.push(wrapBase64(att.buffer.toString("base64")));
+      lines.push("");
+    }
+    lines.push(`--${relBoundary}--`);
+    lines.push("");
+  } else if (hasHtml) {
+    lines.push("Content-Type: text/html; charset=utf-8");
+    lines.push("Content-Transfer-Encoding: 7bit");
+    lines.push("");
+    lines.push(html);
+  } else {
+    lines.push("Content-Type: text/plain; charset=utf-8");
+    lines.push("Content-Transfer-Encoding: 7bit");
+    lines.push("");
+    lines.push(text || "");
+  }
+
+  return Buffer.from(lines.join(CRLF), "utf8");
 }
 
 /**
  * Envía un correo individual.
- *
- * @param {object} args
- * @param {string} args.from
- * @param {string} args.to
- * @param {string} args.subject
- * @param {string} [args.html]    Puede incluir <img src="data:image/...">.
- * @param {string} [args.text]
- * @param {string} [args.replyTo]
- * @returns {Promise<{ok, messageId, error, code, inlineImages}>}
  */
 async function sendOneEmail({ from, to, subject, html, text, replyTo }) {
   const sender =
@@ -163,32 +269,34 @@ async function sendOneEmail({ from, to, subject, html, text, replyTo }) {
     };
   }
 
-  // 1) Extraer imágenes base64 → adjuntos inline CID.
   const { html: htmlWithCids, attachments } = extractInlineImages(html || "");
 
-  const mailOptions = {
-    from: sender,
-    to,
-    subject,
-    ...(text ? { text } : {}),
-    ...(htmlWithCids ? { html: htmlWithCids } : {}),
-    ...(replyTo ? { replyTo } : {}),
-    ...(attachments.length ? { attachments } : {}),
-  };
+  let rawMime;
+  try {
+    rawMime = buildMimeRaw({
+      from: sender,
+      to,
+      subject,
+      text,
+      html: htmlWithCids,
+      replyTo,
+      attachments,
+    });
+  } catch (err) {
+    return {
+      ok: false,
+      error: err?.message || "Error construyendo MIME",
+      code: "MIME_BUILD_ERROR",
+    };
+  }
 
   try {
-    // 2) Construir raw MIME (nodemailer arma el multipart/related correcto).
-    const rawMime = await buildRawMime(mailOptions);
-
-    // 3) Enviar vía SES v2 con Content.Raw.
     const sesClient = getSesClient();
     const cmd = new SendEmailCommand({
       FromEmailAddress: sender,
       Destination: { ToAddresses: [to] },
       Content: {
-        Raw: {
-          Data: rawMime,
-        },
+        Raw: { Data: rawMime },
       },
     });
     const resp = await sesClient.send(cmd);
@@ -210,5 +318,5 @@ module.exports = {
   getSesClient,
   sendOneEmail,
   extractInlineImages,
-  buildRawMime,
+  buildMimeRaw,
 };
