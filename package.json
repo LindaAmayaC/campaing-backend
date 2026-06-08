@@ -19,6 +19,7 @@
     "cors": "^2.8.6",
     "dotenv": "^17.4.2",
     "express": "^4.21.2",
+    "nodemailer": "^8.0.10",
     "p-limit": "^7.3.0"
   },
   "devDependencies": {
