@@ -480,13 +480,21 @@ app.post("/apply-campaign/whatsapp", async (req, res) => {
 // Espera body:
 // {
 //   campaignId: "Verano2026-2026-06-07",
+//   campaignName: "Verano 2026",          // opcional, se sustituye en {{destino}}
 //   from: "no-reply@viajesyviajes.com",   // opcional, default SES_DEFAULT_FROM
-//   subject: "Asunto",
-//   html: "<p>Cuerpo HTML</p>",           // html y/o text (al menos uno)
-//   text: "Cuerpo plano",                 // opcional
+//   subject: "Hola {{nombre}}, oferta {{destino}}",
+//   html: "<p>Hola {{nombre}}, ...</p>",  // html y/o text (al menos uno)
+//   text: "Hola {{nombre}}, ...",         // opcional
 //   replyTo: "ventas@viajesyviajes.com",  // opcional
+//   // Una de:
+//   recipients: [{email:"a@b.com", name:"Ana Pérez"}, ...]  // PREFERIDO (permite personalizar)
+//   // o (compat):
 //   destinos: ["a@b.com", "c@d.com", ...]
 // }
+//
+// Merge tags soportados en subject/html/text:
+//   {{nombre}}    → primer nombre del recipient (extrae primera palabra de name)
+//   {{destino}}   → campaignName (constante por campaña)
 //
 // Credenciales SES en env:
 //   AWS_REGION, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, SES_DEFAULT_FROM
@@ -496,6 +504,58 @@ app.post("/apply-campaign/whatsapp", async (req, res) => {
 // Idempotencia por (campaignId|email) reutilizando el sentCache.
 
 const emailLimit = pLimit(10);
+
+// --- Helpers de merge tags ---
+//
+// Sustituye {{nombre}} y {{destino}} en el template. Si una variable no
+// está disponible (e.g. el recipient no tiene name), se reemplaza por "".
+// Importante: usa regex con flag `g` y escapa el nombre del placeholder.
+function substituteMergeTags(template, vars) {
+  if (typeof template !== "string" || !template.includes("{{")) return template;
+  return template.replace(/\{\{\s*(\w+)\s*\}\}/g, (_match, key) => {
+    const v = vars?.[key];
+    return v != null ? String(v) : "";
+  });
+}
+
+// Detecta rápido si un campo trae merge tags — solo para logs.
+function detectMergeTags(...texts) {
+  return texts.some((t) => typeof t === "string" && /\{\{\s*\w+\s*\}\}/.test(t));
+}
+
+// Extrae el primer nombre. Si name="Julieta Pérez González" → "Julieta".
+function firstName(name) {
+  return String(name || "")
+    .trim()
+    .split(/\s+/)[0] || "";
+}
+
+// Acepta:
+//   recipients=[{email, name}]   ← formato nuevo (preferido)
+//   destinos=["a@b.com", ...]    ← legacy (sin personalización)
+// Devuelve siempre [{email, name}] limpio.
+function normalizeRecipients(recipientsRaw, destinosRaw) {
+  if (Array.isArray(recipientsRaw) && recipientsRaw.length) {
+    return recipientsRaw
+      .map((r) => {
+        if (typeof r === "string") return { email: r.trim(), name: "" };
+        if (r && typeof r === "object") {
+          return {
+            email: String(r.email || "").trim(),
+            name: String(r.name || "").trim(),
+          };
+        }
+        return null;
+      })
+      .filter((r) => r && r.email);
+  }
+  if (Array.isArray(destinosRaw)) {
+    return destinosRaw
+      .map((d) => ({ email: String(d || "").trim(), name: "" }))
+      .filter((r) => r.email);
+  }
+  return [];
+}
 
 app.post("/apply-campaign/email", async (req, res) => {
   if (!process.env.AWS_ACCESS_KEY_ID || !process.env.AWS_SECRET_ACCESS_KEY) {
@@ -511,7 +571,17 @@ app.post("/apply-campaign/email", async (req, res) => {
     });
   }
 
-  const { campaignId, from, subject, html, text, replyTo, destinos } = req.body || {};
+  const {
+    campaignId,
+    campaignName,
+    from,
+    subject,
+    html,
+    text,
+    replyTo,
+    destinos,
+    recipients: recipientsRaw,
+  } = req.body || {};
 
   if (!campaignId || typeof campaignId !== "string") {
     return res
@@ -528,13 +598,24 @@ app.post("/apply-campaign/email", async (req, res) => {
       .status(400)
       .json({ ok: false, error: "Debes incluir 'html' y/o 'text'." });
   }
-  if (!Array.isArray(destinos) || destinos.length === 0) {
+
+  // Normalizar recipients: aceptamos el formato nuevo [{email, name}] y el
+  // legacy ["email"]. Internamente trabajamos siempre con {email, name}.
+  const recipients = normalizeRecipients(recipientsRaw, destinos);
+  if (recipients.length === 0) {
     return res
       .status(400)
-      .json({ ok: false, error: "destinos debe ser un array no vacío." });
+      .json({
+        ok: false,
+        error: "Debes mandar 'recipients' o 'destinos' con al menos un destino.",
+      });
   }
 
-  logger.info("email.batch.start", { campaignId, batchSize: destinos.length });
+  logger.info("email.batch.start", {
+    campaignId,
+    batchSize: recipients.length,
+    hasMergeTags: detectMergeTags(subject, html, text),
+  });
 
   const results = {
     ok: true,
@@ -545,9 +626,9 @@ app.post("/apply-campaign/email", async (req, res) => {
     messageIds: [],
   };
 
-  const jobs = destinos.map((to) =>
+  const jobs = recipients.map((rcp) =>
     emailLimit(async () => {
-      const dest = String(to || "").trim();
+      const dest = rcp.email;
       if (!dest) {
         results.errors.push("(vacio) destino vacío");
         results.rejected += 1;
@@ -560,7 +641,23 @@ app.post("/apply-campaign/email", async (req, res) => {
         return;
       }
 
-      const r = await sendOneEmail({ from, to: dest, subject, html, text, replyTo });
+      // Variables disponibles para este destinatario.
+      const vars = {
+        nombre: firstName(rcp.name),
+        destino: String(campaignName || "").trim(),
+      };
+      const personalSubject = substituteMergeTags(subject, vars);
+      const personalHtml = html ? substituteMergeTags(html, vars) : html;
+      const personalText = text ? substituteMergeTags(text, vars) : text;
+
+      const r = await sendOneEmail({
+        from,
+        to: dest,
+        subject: personalSubject,
+        html: personalHtml,
+        text: personalText,
+        replyTo,
+      });
       if (r.ok) {
         results.sent += 1;
         results.messageIds.push(r.messageId);
