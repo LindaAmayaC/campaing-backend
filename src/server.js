@@ -10,6 +10,7 @@ const pLimit = require("p-limit").default;
 const logger = require("./lib/logger");
 const metrics = require("./lib/metrics");
 const { sendOneEmail } = require("./lib/ses");
+const db = require("./lib/db");
 
 const app = express();
 
@@ -126,13 +127,13 @@ async function postToMetaWithRetry(url, payload, token) {
   let attempt = 0;
   while (true) {
     try {
-      await metaAxios.post(url, payload, {
+      const resp = await metaAxios.post(url, payload, {
         headers: {
           Authorization: `Bearer ${token}`,
           "Content-Type": "application/json",
         },
       });
-      return { ok: true };
+      return { ok: true, data: resp?.data };
     } catch (err) {
       if (attempt < MAX_RETRIES && isRetriable(err)) {
         const backoff = 500 * Math.pow(2, attempt); // 500ms, 1s
@@ -202,9 +203,11 @@ app.get("/health", (req, res) => {
       AWS_ACCESS_KEY_ID_present: Boolean(process.env.AWS_ACCESS_KEY_ID),
       AWS_SECRET_ACCESS_KEY_present: Boolean(process.env.AWS_SECRET_ACCESS_KEY),
       SES_DEFAULT_FROM_present: Boolean(process.env.SES_DEFAULT_FROM),
+      DATABASE_URL_present: Boolean(process.env.DATABASE_URL),
       PORT: process.env.PORT || null,
       NODE_ENV: process.env.NODE_ENV || null,
     },
+    db: { enabled: db.isEnabled() },
     cache: {
       sentEntries: sentCache.size,
     },
@@ -310,7 +313,7 @@ app.post("/apply-campaign/sms", async (req, res) => {
       .json({ ok: false, error: "ONMALL_AUTH no configurado en el servidor." });
   }
 
-  const { mensaje, destinos, sendAt } = req.body || {};
+  const { mensaje, destinos, sendAt, campaignId, campaignName } = req.body || {};
   if (!mensaje || typeof mensaje !== "string") {
     return res
       .status(400)
@@ -349,6 +352,43 @@ app.post("/apply-campaign/sms", async (req, res) => {
       },
     );
     console.log(`[apply-campaign/sms] enviados ${destinos.length} destinos`);
+
+    // --- Persistencia de tracking (best-effort) ---
+    // Infobip devuelve data.messages[] con { to, messageId, status{...} }.
+    // Guardamos una fila por destino con su messageId para cruzar luego el
+    // reporte de entrega (DLR / polling).
+    try {
+      const trackId = String(campaignId || "sms-adhoc");
+      await db.upsertCampaign(trackId, campaignName);
+      const respMsgs = Array.isArray(r.data?.messages) ? r.data.messages : [];
+      // Mapa to -> {messageId, status} para casar con la lista original.
+      const byTo = new Map();
+      for (const m of respMsgs) {
+        if (m && m.to) byTo.set(String(m.to), m);
+      }
+      const rows = destinos.map((to) => {
+        const m = byTo.get(String(to)) || {};
+        const groupName = m?.status?.groupName || "";
+        // Grupos Infobip: PENDING/DELIVERED = aceptado; REJECTED/UNDELIVERABLE = fallo.
+        const rejected = /REJECTED|UNDELIVERABLE/i.test(groupName);
+        return {
+          campaignId: trackId,
+          channel: "sms",
+          recipient: String(to),
+          recipientName: null,
+          providerMessageId: m.messageId || null,
+          sendStatus: rejected ? "failed" : "accepted",
+          sendError: rejected
+            ? m?.status?.name || m?.status?.description || groupName
+            : null,
+          providerRaw: m?.status ? { status: m.status } : null,
+        };
+      });
+      await db.insertMessages(rows);
+    } catch (e) {
+      logger.error("sms.persist.failed", { error: e?.message });
+    }
+
     return res.json({ ok: true, sent: destinos.length, data: r.data });
   } catch (err) {
     const status = err?.response?.status || 500;
@@ -388,7 +428,7 @@ app.post("/apply-campaign/whatsapp", async (req, res) => {
       .json({ ok: false, error: "WHATSAPP_TOKEN no configurado en el servidor." });
   }
 
-  const { campaignId, messages } = req.body || {};
+  const { campaignId, campaignName, messages } = req.body || {};
   // phoneNumberId: prefiere env (recomendado); body solo como override.
   const phoneNumberId =
     process.env.WHATSAPP_PHONE_NUMBER_ID || req.body?.phoneNumberId || "";
@@ -417,6 +457,7 @@ app.post("/apply-campaign/whatsapp", async (req, res) => {
   logger.info("wa.batch.start", { campaignId, batchSize: messages.length });
 
   const results = { ok: true, sent: 0, duplicates: 0, errors: [] };
+  const trackRows = []; // filas para persistir (best-effort)
 
   const jobs = messages.map((msg) =>
     limit(async () => {
@@ -440,6 +481,19 @@ app.post("/apply-campaign/whatsapp", async (req, res) => {
         results.sent += 1;
         metrics.inc("wa.sent");
         markSent(campaignId, to);
+        // wamid: id del mensaje devuelto por Meta, clave para cruzar el
+        // estado de entrega que llega después por webhook.
+        const wamid = r.data?.messages?.[0]?.id || null;
+        trackRows.push({
+          campaignId,
+          channel: "whatsapp",
+          recipient: String(to),
+          recipientName: msg?.name || null,
+          providerMessageId: wamid,
+          sendStatus: "accepted",
+          sendError: null,
+          providerRaw: r.data ? { contacts: r.data.contacts } : null,
+        });
       } else {
         const err = r.err;
         const errMsg =
@@ -457,11 +511,32 @@ app.post("/apply-campaign/whatsapp", async (req, res) => {
           status: err?.response?.status,
           error: typeof errMsg === "string" ? errMsg : JSON.stringify(errMsg),
         });
+        trackRows.push({
+          campaignId,
+          channel: "whatsapp",
+          recipient: String(to),
+          recipientName: msg?.name || null,
+          providerMessageId: null,
+          sendStatus: "failed",
+          sendError:
+            typeof errMsg === "string" ? errMsg : JSON.stringify(errMsg),
+          deliveryStatus: "failed",
+          deliveryReason:
+            typeof errMsg === "string" ? errMsg : JSON.stringify(errMsg),
+        });
       }
     }),
   );
 
   await Promise.allSettled(jobs);
+
+  // Persistencia de tracking (best-effort, no bloquea la respuesta si falla).
+  try {
+    await db.upsertCampaign(campaignId, campaignName);
+    await db.insertMessages(trackRows);
+  } catch (e) {
+    logger.error("wa.persist.failed", { error: e?.message });
+  }
 
   logger.info("wa.batch.done", {
     campaignId,
@@ -625,6 +700,7 @@ app.post("/apply-campaign/email", async (req, res) => {
     errors: [],
     messageIds: [],
   };
+  const trackRows = []; // filas para persistir (best-effort)
 
   const jobs = recipients.map((rcp) =>
     emailLimit(async () => {
@@ -663,17 +739,47 @@ app.post("/apply-campaign/email", async (req, res) => {
         results.messageIds.push(r.messageId);
         metrics.inc("email.sent");
         markSent(campaignId, dest);
+        // MessageId de SES: clave para cruzar bounces/complaints/deliveries
+        // que llegan después por SNS.
+        trackRows.push({
+          campaignId,
+          channel: "email",
+          recipient: dest,
+          recipientName: rcp.name || null,
+          providerMessageId: r.messageId || null,
+          sendStatus: "accepted",
+          sendError: null,
+        });
       } else {
         results.ok = false;
         results.rejected += 1;
         results.errors.push(`(${dest}) ${r.error || r.code || "Error SES"}`);
         metrics.inc("email.failed");
         logger.error("email.failed", { to: dest, code: r.code, error: r.error });
+        trackRows.push({
+          campaignId,
+          channel: "email",
+          recipient: dest,
+          recipientName: rcp.name || null,
+          providerMessageId: null,
+          sendStatus: "failed",
+          sendError: r.error || r.code || "Error SES",
+          deliveryStatus: "failed",
+          deliveryReason: r.error || r.code || "Error SES",
+        });
       }
     }),
   );
 
   await Promise.allSettled(jobs);
+
+  // Persistencia de tracking (best-effort, no bloquea la respuesta si falla).
+  try {
+    await db.upsertCampaign(campaignId, campaignName);
+    await db.insertMessages(trackRows);
+  } catch (e) {
+    logger.error("email.persist.failed", { error: e?.message });
+  }
 
   logger.info("email.batch.done", {
     campaignId,
@@ -692,5 +798,10 @@ app.listen(PORT, () => {
   logger.info("server.started", {
     port: Number(PORT),
     nodeEnv: process.env.NODE_ENV || null,
+    dbEnabled: db.isEnabled(),
   });
+  // Crea las tablas de tracking si hay DATABASE_URL. No bloquea el arranque.
+  db.init().catch((err) =>
+    logger.error("db.init.unhandled", { error: err?.message }),
+  );
 });
