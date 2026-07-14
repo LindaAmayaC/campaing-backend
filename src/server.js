@@ -11,6 +11,7 @@ const logger = require("./lib/logger");
 const metrics = require("./lib/metrics");
 const { sendOneEmail } = require("./lib/ses");
 const db = require("./lib/db");
+const { startSmsPoller } = require("./lib/smsPoller");
 
 const app = express();
 
@@ -78,8 +79,24 @@ app.options("*", cors(corsOptions));
 // ===============================
 // JSON
 // ===============================
+//
+// Guardamos el body crudo (rawBody) para poder verificar la firma
+// X-Hub-Signature-256 del webhook de Meta (se calcula sobre los bytes
+// exactos recibidos, no sobre el JSON re-serializado).
 
-app.use(express.json({ limit: "50mb" }));
+app.use(
+  express.json({
+    limit: "50mb",
+    verify: (req, _res, buf) => {
+      req.rawBody = buf;
+    },
+  }),
+);
+
+// SNS (SES) manda Content-Type text/plain; charset=UTF-8, así que
+// express.json NO lo parsea. Este parser text cubre ese caso solo para
+// el webhook de SES.
+app.use("/webhooks/ses", express.text({ type: "*/*", limit: "5mb" }));
 
 // ===============================
 // AUTH POR API KEY
@@ -89,7 +106,7 @@ app.use(express.json({ limit: "50mb" }));
 // ===============================
 
 const API_SECRET = process.env.API_SECRET || "";
-const PROTECTED_PREFIXES = ["/apply-campaign/", "/whatsapp/"];
+const PROTECTED_PREFIXES = ["/apply-campaign/", "/whatsapp/", "/reports/"];
 
 function requireApiKey(req, res, next) {
   if (!API_SECRET) return next(); // sin secret configurado → pasa (dev)
@@ -792,6 +809,301 @@ app.post("/apply-campaign/email", async (req, res) => {
   res.json(results);
 });
 
+// ===============================
+// REPORTES DE ENTREGA (lee la DB de tracking)
+// ===============================
+//
+// GET /reports/campaigns
+//   Resumen por campaña (agrupado por NOMBRE, porque el campaignId difiere
+//   entre canales). Devuelve, por canal, cuántos se enviaron / entregaron /
+//   rebotaron / fallaron.
+//
+// GET /reports/campaigns/messages?name=<campaña>&channel=&status=&limit=&offset=
+//   Detalle por destinatario (con el motivo de cada uno).
+
+app.get("/reports/campaigns", async (req, res) => {
+  if (!db.isEnabled()) {
+    return res.json({ ok: true, dbEnabled: false, campaigns: [] });
+  }
+  try {
+    const { rows } = await db.query(
+      `SELECT COALESCE(c.name, m.campaign_id) AS campaign_name,
+              m.channel,
+              m.send_status,
+              m.delivery_status,
+              count(*)::int AS n,
+              min(m.sent_at) AS first_sent,
+              max(m.sent_at) AS last_sent
+         FROM messages m
+         LEFT JOIN campaigns c ON c.id = m.campaign_id
+        GROUP BY campaign_name, m.channel, m.send_status, m.delivery_status`,
+      [],
+    );
+
+    // Reagrupamos en JS: { name -> { channels: { sms:{...} }, totals } }
+    const byCampaign = new Map();
+    for (const r of rows) {
+      const key = r.campaign_name;
+      if (!byCampaign.has(key)) {
+        byCampaign.set(key, {
+          name: key,
+          firstSent: r.first_sent,
+          lastSent: r.last_sent,
+          channels: {},
+          totals: { enviados: 0, entregados: 0, rebotados: 0, fallidos: 0, leidos: 0, pendientes: 0 },
+        });
+      }
+      const camp = byCampaign.get(key);
+      if (r.first_sent < camp.firstSent) camp.firstSent = r.first_sent;
+      if (r.last_sent > camp.lastSent) camp.lastSent = r.last_sent;
+
+      const ch = (camp.channels[r.channel] = camp.channels[r.channel] || {
+        enviados: 0, entregados: 0, rebotados: 0, fallidos: 0, leidos: 0, pendientes: 0,
+      });
+
+      const n = r.n;
+      // "enviados" = aceptados por el proveedor (send_status accepted).
+      if (r.send_status === "accepted") {
+        ch.enviados += n;
+        camp.totals.enviados += n;
+      }
+      // Estado de entrega.
+      const ds = r.delivery_status;
+      if (ds === "delivered") { ch.entregados += n; camp.totals.entregados += n; }
+      else if (ds === "read") { ch.leidos += n; ch.entregados += n; camp.totals.leidos += n; camp.totals.entregados += n; }
+      else if (ds === "bounced") { ch.rebotados += n; camp.totals.rebotados += n; }
+      else if (ds === "complaint") { ch.rebotados += n; camp.totals.rebotados += n; }
+      else if (ds === "failed") { ch.fallidos += n; camp.totals.fallidos += n; }
+      else if (ds === "pending") { ch.pendientes += n; camp.totals.pendientes += n; }
+    }
+
+    const campaigns = Array.from(byCampaign.values()).sort((a, b) =>
+      String(b.lastSent).localeCompare(String(a.lastSent)),
+    );
+    return res.json({ ok: true, dbEnabled: true, campaigns });
+  } catch (err) {
+    logger.error("reports.campaigns.failed", { error: err?.message });
+    return res.status(500).json({ ok: false, error: err?.message });
+  }
+});
+
+app.get("/reports/campaigns/messages", async (req, res) => {
+  if (!db.isEnabled()) {
+    return res.json({ ok: true, dbEnabled: false, messages: [] });
+  }
+  const name = String(req.query.name || "").trim();
+  if (!name) {
+    return res.status(400).json({ ok: false, error: "Falta ?name=<campaña>" });
+  }
+  const channel = String(req.query.channel || "").trim();
+  const status = String(req.query.status || "").trim(); // delivery_status
+  const limit = Math.min(Number(req.query.limit) || 500, 5000);
+  const offset = Number(req.query.offset) || 0;
+
+  const where = ["COALESCE(c.name, m.campaign_id) = $1"];
+  const params = [name];
+  if (channel) { params.push(channel); where.push(`m.channel = $${params.length}`); }
+  if (status) { params.push(status); where.push(`m.delivery_status = $${params.length}`); }
+  params.push(limit); const pLimitIdx = params.length;
+  params.push(offset); const pOffsetIdx = params.length;
+
+  try {
+    const { rows } = await db.query(
+      `SELECT m.recipient, m.recipient_name, m.channel, m.send_status,
+              m.delivery_status, m.delivery_reason, m.sent_at, m.delivered_at
+         FROM messages m
+         LEFT JOIN campaigns c ON c.id = m.campaign_id
+        WHERE ${where.join(" AND ")}
+        ORDER BY m.sent_at DESC
+        LIMIT $${pLimitIdx} OFFSET $${pOffsetIdx}`,
+      params,
+    );
+    return res.json({ ok: true, dbEnabled: true, count: rows.length, messages: rows });
+  } catch (err) {
+    logger.error("reports.messages.failed", { error: err?.message });
+    return res.status(500).json({ ok: false, error: err?.message });
+  }
+});
+
+// ===============================
+// WEBHOOK WHATSAPP (estados de entrega de Meta)
+// ===============================
+//
+// Meta llama a este endpoint con los cambios de estado de cada mensaje:
+//   sent -> delivered -> read   (o failed, con motivo)
+// Se cruza por el wamid (statuses[].id) que guardamos al enviar.
+//
+// GET  = verificación del webhook (Meta manda hub.challenge al configurarlo).
+// POST = eventos. Siempre respondemos 200 rápido para que Meta no reintente.
+//
+// No está protegido por API key (Meta no manda ese header): /webhooks/ no
+// está en PROTECTED_PREFIXES.
+
+const crypto = require("crypto");
+
+app.get("/webhooks/whatsapp", (req, res) => {
+  const verifyToken = process.env.WHATSAPP_VERIFY_TOKEN || "";
+  const mode = req.query["hub.mode"];
+  const token = req.query["hub.verify_token"];
+  const challenge = req.query["hub.challenge"];
+  if (mode === "subscribe" && verifyToken && token === verifyToken) {
+    logger.info("wa.webhook.verified");
+    return res.status(200).send(String(challenge || ""));
+  }
+  logger.warn("wa.webhook.verify_failed", { mode });
+  return res.sendStatus(403);
+});
+
+// Verifica la firma X-Hub-Signature-256 (HMAC-SHA256 con el App Secret de
+// Meta) si WHATSAPP_APP_SECRET está configurado. Best-effort: si no hay
+// secret o no hay rawBody, no bloquea (solo se pierde la verificación).
+function verifyMetaSignature(req) {
+  const appSecret = process.env.WHATSAPP_APP_SECRET || "";
+  if (!appSecret) return true; // verificación desactivada
+  const sig = req.get("X-Hub-Signature-256") || "";
+  if (!sig || !req.rawBody) return false;
+  const expected =
+    "sha256=" +
+    crypto.createHmac("sha256", appSecret).update(req.rawBody).digest("hex");
+  try {
+    return crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected));
+  } catch (_) {
+    return false;
+  }
+}
+
+function mapWaStatus(status) {
+  const s = String(status?.status || "").toLowerCase();
+  if (s === "delivered") return { deliveryStatus: "delivered", terminal: true };
+  if (s === "read") return { deliveryStatus: "read", terminal: true };
+  if (s === "sent") return { deliveryStatus: "sent", terminal: false };
+  if (s === "failed") {
+    const e = Array.isArray(status?.errors) ? status.errors[0] : null;
+    const reason =
+      e?.title || e?.message || e?.error_data?.details || "failed";
+    return { deliveryStatus: "failed", reason, terminal: true };
+  }
+  return { deliveryStatus: null, terminal: false };
+}
+
+app.post("/webhooks/whatsapp", async (req, res) => {
+  // Responder 200 cuanto antes; procesamos después.
+  res.sendStatus(200);
+
+  if (!verifyMetaSignature(req)) {
+    logger.warn("wa.webhook.bad_signature");
+    return;
+  }
+
+  try {
+    const entries = Array.isArray(req.body?.entry) ? req.body.entry : [];
+    for (const entry of entries) {
+      const changes = Array.isArray(entry?.changes) ? entry.changes : [];
+      for (const change of changes) {
+        const statuses = change?.value?.statuses;
+        if (!Array.isArray(statuses)) continue;
+        for (const st of statuses) {
+          const wamid = st?.id;
+          if (!wamid) continue;
+          const { deliveryStatus, reason, terminal } = mapWaStatus(st);
+          if (!deliveryStatus) continue;
+          await db.updateDeliveryByProviderId("whatsapp", wamid, {
+            deliveryStatus,
+            deliveryReason: reason || null,
+            setDeliveredAt: terminal,
+            providerRaw: { status: st.status, errors: st.errors || null },
+          });
+        }
+      }
+    }
+  } catch (err) {
+    logger.error("wa.webhook.process_failed", { error: err?.message });
+  }
+});
+
+// ===============================
+// WEBHOOK SES (bounces / complaints / deliveries vía SNS)
+// ===============================
+//
+// SES publica en un SNS Topic y SNS hace POST a este endpoint. Dos casos:
+//   - SubscriptionConfirmation: hay que confirmar visitando SubscribeURL.
+//   - Notification: el campo Message es un JSON con eventType (Bounce /
+//     Complaint / Delivery / ...) y mail.messageId → se cruza por messageId.
+//
+// El body llega como text/plain (parser express.text arriba).
+
+function mapSesEvent(msg) {
+  const type = String(msg?.eventType || msg?.notificationType || "").toLowerCase();
+  if (type === "delivery") {
+    return { deliveryStatus: "delivered", reason: null, terminal: true };
+  }
+  if (type === "bounce") {
+    const b = msg?.bounce || {};
+    const rcp = Array.isArray(b.bouncedRecipients) ? b.bouncedRecipients[0] : null;
+    const reason =
+      rcp?.diagnosticCode ||
+      [b.bounceType, b.bounceSubType].filter(Boolean).join("/") ||
+      "bounce";
+    return { deliveryStatus: "bounced", reason, terminal: true };
+  }
+  if (type === "complaint") {
+    const c = msg?.complaint || {};
+    return {
+      deliveryStatus: "complaint",
+      reason: c.complaintFeedbackType || "complaint",
+      terminal: true,
+    };
+  }
+  return { deliveryStatus: null, reason: null, terminal: false };
+}
+
+app.post("/webhooks/ses", async (req, res) => {
+  let envelope;
+  try {
+    envelope = typeof req.body === "string" ? JSON.parse(req.body) : req.body;
+  } catch (_) {
+    return res.sendStatus(400);
+  }
+  res.sendStatus(200); // ack rápido
+
+  try {
+    const snsType =
+      envelope?.Type || req.get("x-amz-sns-message-type") || "";
+
+    // Confirmación de suscripción: visitar SubscribeURL una vez.
+    if (snsType === "SubscriptionConfirmation" && envelope?.SubscribeURL) {
+      try {
+        await axios.get(envelope.SubscribeURL, { timeout: 15000 });
+        logger.info("ses.webhook.subscription_confirmed");
+      } catch (err) {
+        logger.error("ses.webhook.confirm_failed", { error: err?.message });
+      }
+      return;
+    }
+
+    if (snsType !== "Notification") return;
+
+    const msg =
+      typeof envelope.Message === "string"
+        ? JSON.parse(envelope.Message)
+        : envelope.Message;
+    const messageId = msg?.mail?.messageId;
+    if (!messageId) return;
+
+    const { deliveryStatus, reason, terminal } = mapSesEvent(msg);
+    if (!deliveryStatus) return;
+
+    await db.updateDeliveryByProviderId("email", messageId, {
+      deliveryStatus,
+      deliveryReason: reason,
+      setDeliveredAt: terminal,
+      providerRaw: { eventType: msg?.eventType || msg?.notificationType },
+    });
+  } catch (err) {
+    logger.error("ses.webhook.process_failed", { error: err?.message });
+  }
+});
+
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
@@ -804,4 +1116,6 @@ app.listen(PORT, () => {
   db.init().catch((err) =>
     logger.error("db.init.unhandled", { error: err?.message }),
   );
+  // Poller de delivery reports de SMS (Infobip). No-op si falta auth o DB.
+  startSmsPoller({ intervalMs: Number(process.env.SMS_POLL_INTERVAL_MS) || undefined });
 });
