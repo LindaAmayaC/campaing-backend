@@ -220,6 +220,8 @@ app.get("/health", (req, res) => {
       AWS_ACCESS_KEY_ID_present: Boolean(process.env.AWS_ACCESS_KEY_ID),
       AWS_SECRET_ACCESS_KEY_present: Boolean(process.env.AWS_SECRET_ACCESS_KEY),
       SES_DEFAULT_FROM_present: Boolean(process.env.SES_DEFAULT_FROM),
+      SES_CONFIGURATION_SET_present: Boolean(process.env.SES_CONFIGURATION_SET),
+      SES_CONFIGURATION_SET_value: process.env.SES_CONFIGURATION_SET || null,
       DATABASE_URL_present: Boolean(process.env.DATABASE_URL),
       PORT: process.env.PORT || null,
       NODE_ENV: process.env.NODE_ENV || null,
