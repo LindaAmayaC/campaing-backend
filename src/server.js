@@ -882,8 +882,12 @@ app.get("/reports/campaigns", async (req, res) => {
       else if (ds === "pending") { ch.pendientes += n; camp.totals.pendientes += n; }
     }
 
-    const campaigns = Array.from(byCampaign.values()).sort((a, b) =>
-      String(b.lastSent).localeCompare(String(a.lastSent)),
+    // Ordenar por fecha real DESC. node-postgres devuelve timestamp como
+    // Date, cuyo String() es "Fri Sep 23 2026 ..." y localeCompare lo
+    // ordena por día de la semana, no por fecha. Convertimos a timestamp
+    // numérico para una comparación correcta.
+    const campaigns = Array.from(byCampaign.values()).sort(
+      (a, b) => new Date(b.lastSent).getTime() - new Date(a.lastSent).getTime(),
     );
     return res.json({ ok: true, dbEnabled: true, campaigns });
   } catch (err) {
