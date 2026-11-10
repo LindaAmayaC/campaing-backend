@@ -69,7 +69,10 @@ const corsOptions = {
     return callback(new Error("Origin no permitido: " + origin));
   },
   methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization"],
+  // X-Api-Key lo manda el marketplace con cada request protegido
+  // (campaingBackendFetch). Sin este permiso, el browser rechaza el
+  // preflight y la request real nunca sale (Failed to fetch).
+  allowedHeaders: ["Content-Type", "Authorization", "X-Api-Key"],
   credentials: true,
 };
 
