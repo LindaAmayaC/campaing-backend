@@ -19,7 +19,13 @@
  * Por eso construimos el MIME a mano.
  *
  * Credenciales en process.env: AWS_REGION, AWS_ACCESS_KEY_ID,
- * AWS_SECRET_ACCESS_KEY, SES_DEFAULT_FROM.
+ * AWS_SECRET_ACCESS_KEY, SES_DEFAULT_FROM, SES_CONFIGURATION_SET.
+ *
+ * SES_CONFIGURATION_SET es obligatorio en producción: sin él los correos
+ * salen pero SES no publica eventos de bounce/complaint/delivery al
+ * webhook SNS suscrito, aunque el webhook esté activo. Si no está en el
+ * entorno se envía igual (para no romper dev local) pero se loguea un
+ * warning una sola vez.
  */
 "use strict";
 
@@ -30,6 +36,36 @@ const {
 } = require("@aws-sdk/client-sesv2");
 
 let _sesClient = null;
+let _configSetWarned = false;
+
+// Códigos/nombres de error SES que ameritan reintento.
+// Doc: https://docs.aws.amazon.com/ses/latest/APIReference-V2/CommonErrors.html
+const RETRYABLE_SES_ERRORS = new Set([
+  "ThrottlingException",
+  "TooManyRequestsException",
+  "SendingPausedException",
+  "ServiceUnavailable",
+  "ServiceUnavailableException",
+  "InternalFailure",
+  "RequestTimeout",
+  "RequestTimeoutException",
+]);
+
+function isRetryableSesError(err) {
+  if (!err) return false;
+  const name = err.name || err.Code || err.code || "";
+  if (RETRYABLE_SES_ERRORS.has(name)) return true;
+  const status = err.$metadata?.httpStatusCode || err.statusCode;
+  if (status === 429 || status === 503 || (status >= 500 && status < 600)) {
+    return true;
+  }
+  const msg = String(err.message || "").toLowerCase();
+  return /throttl|too many|rate exceeded|timeout|unavailable/.test(msg);
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 function getSesClient() {
   if (_sesClient) return _sesClient;
@@ -290,28 +326,55 @@ async function sendOneEmail({ from, to, subject, html, text, replyTo }) {
     };
   }
 
-  try {
-    const sesClient = getSesClient();
-    const cmd = new SendEmailCommand({
+  const configSet =
+    process.env.SES_CONFIGURATION_SET &&
+    String(process.env.SES_CONFIGURATION_SET).trim();
+  if (!configSet && !_configSetWarned) {
+    _configSetWarned = true;
+    // No bloqueamos envíos sin config set (útil en dev local), pero avisamos
+    // una sola vez: en producción los eventos de bounce/complaint no llegarán
+    // al webhook sin esto.
+    console.warn(
+      "[SES] SES_CONFIGURATION_SET no está definido. Los correos saldrán " +
+        "pero SES NO publicará eventos (bounce/complaint/delivery) al webhook.",
+    );
+  }
+
+  const sesClient = getSesClient();
+  const buildCmd = () =>
+    new SendEmailCommand({
       FromEmailAddress: sender,
       Destination: { ToAddresses: [to] },
-      Content: {
-        Raw: { Data: rawMime },
-      },
+      Content: { Raw: { Data: rawMime } },
+      ...(configSet ? { ConfigurationSetName: configSet } : {}),
     });
-    const resp = await sesClient.send(cmd);
-    return {
-      ok: true,
-      messageId: resp?.MessageId || null,
-      inlineImages: attachments.length,
-    };
-  } catch (err) {
-    return {
-      ok: false,
-      error: err?.message || "Error SES desconocido",
-      code: err?.name || err?.Code || "SES_ERROR",
-    };
+
+  // Retry con backoff exponencial para errores transitorios de SES.
+  // 1s, 2s, 4s (más jitter ±20%). Total ~7s en el peor caso.
+  const MAX_ATTEMPTS = 4;
+  let lastErr = null;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
+    try {
+      const resp = await sesClient.send(buildCmd());
+      return {
+        ok: true,
+        messageId: resp?.MessageId || null,
+        inlineImages: attachments.length,
+        attempts: attempt,
+      };
+    } catch (err) {
+      lastErr = err;
+      if (attempt >= MAX_ATTEMPTS || !isRetryableSesError(err)) break;
+      const base = 1000 * Math.pow(2, attempt - 1);
+      const jitter = base * (0.8 + Math.random() * 0.4);
+      await sleep(jitter);
+    }
   }
+  return {
+    ok: false,
+    error: lastErr?.message || "Error SES desconocido",
+    code: lastErr?.name || lastErr?.Code || "SES_ERROR",
+  };
 }
 
 module.exports = {

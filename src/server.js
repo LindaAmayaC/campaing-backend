@@ -1057,6 +1057,21 @@ function mapSesEvent(msg) {
   return { deliveryStatus: null, reason: null, terminal: false };
 }
 
+// Validador de firma SNS. Verifica que el POST venga realmente de AWS SNS
+// (certificado emitido por *.amazonaws.com, firma válida sobre los campos
+// canónicos del mensaje). Sin esto, cualquiera que descubra la URL del
+// webhook puede inyectar "bounces" falsos y hacer que suprimamos contactos
+// legítimos.
+const MessageValidator = require("sns-validator");
+const snsValidator = new MessageValidator();
+const validateSns = (payload) =>
+  new Promise((resolve, reject) => {
+    snsValidator.validate(payload, (err, msg) => {
+      if (err) reject(err);
+      else resolve(msg);
+    });
+  });
+
 app.post("/webhooks/ses", async (req, res) => {
   let envelope;
   try {
@@ -1064,13 +1079,29 @@ app.post("/webhooks/ses", async (req, res) => {
   } catch (_) {
     return res.sendStatus(400);
   }
-  res.sendStatus(200); // ack rápido
+
+  // Validar firma SNS ANTES de ack. Si falla, respondemos 403 y nada más:
+  // no procesamos, no actualizamos la DB y no visitamos el SubscribeURL
+  // (un atacante podría estar enviando una URL maliciosa).
+  try {
+    await validateSns(envelope);
+  } catch (err) {
+    logger.warn("ses.webhook.invalid_signature", {
+      error: err?.message,
+      type: envelope?.Type,
+      topicArn: envelope?.TopicArn,
+    });
+    return res.sendStatus(403);
+  }
+
+  res.sendStatus(200); // ack rápido tras verificar firma
 
   try {
     const snsType =
       envelope?.Type || req.get("x-amz-sns-message-type") || "";
 
-    // Confirmación de suscripción: visitar SubscribeURL una vez.
+    // Confirmación de suscripción: visitar SubscribeURL una vez. Seguro
+    // hacerlo aquí porque la firma ya fue validada.
     if (snsType === "SubscriptionConfirmation" && envelope?.SubscribeURL) {
       try {
         await axios.get(envelope.SubscribeURL, { timeout: 15000 });
